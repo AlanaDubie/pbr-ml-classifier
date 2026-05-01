@@ -13,21 +13,24 @@ def get_maya_main_window():
 
 class SceneScannerUI(QtWidgets.QWidget):
 
-    def __init__(self, parent=get_maya_main_window()):
+    def __init__(self, parent=None):  # ← don't call function in default arg
+        if parent is None:
+            parent = get_maya_main_window()  # ← call it here instead
         super().__init__(parent)
 
         self.scanner = SceneScanner()
         self.objects = []
 
         self.setup_ui()
+        self.show()  # ← this is what was missing
 
     def setup_ui(self):
         self.setWindowTitle("Scene Scanner (MVP)")
         self.setMinimumWidth(400)
+        self.setWindowFlags(QtCore.Qt.Window)
 
         layout = QtWidgets.QVBoxLayout(self)
 
-        # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
 
         self.scan_sel_btn = QtWidgets.QPushButton("Scan Selection")
@@ -41,23 +44,16 @@ class SceneScannerUI(QtWidgets.QWidget):
 
         layout.addLayout(btn_layout)
 
-        # List UI
         self.list_widget = QtWidgets.QListWidget()
         layout.addWidget(self.list_widget)
 
-        # Status label
         self.status = QtWidgets.QLabel("Ready")
         layout.addWidget(self.status)
-
-    # -----------------------
-    # Scan functions
-    # -----------------------
 
     def scan_selection(self):
         self.objects = self.scanner.get_selected_meshes()
         self.populate_list()
         self.status.setText(f"Selected Scan: {len(self.objects)} objects")
-
         print("---- Selected Objects ----")
         for obj in self.objects:
             print(obj)
@@ -66,22 +62,15 @@ class SceneScannerUI(QtWidgets.QWidget):
         self.objects = self.scanner.get_all_scene_meshes()
         self.populate_list()
         self.status.setText(f"Scene Scan: {len(self.objects)} objects")
-
         print("---- Scene Objects ----")
         for obj in self.objects:
             print(obj)
 
-    # -----------------------
-    # UI helper
-    # -----------------------
-
     def populate_list(self):
         self.list_widget.clear()
-
         if not self.objects:
             self.list_widget.addItem("No objects found")
             return
-
         for obj in self.objects:
             short = obj.split("|")[-1]
             self.list_widget.addItem(short)
