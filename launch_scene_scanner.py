@@ -1,7 +1,8 @@
 import importlib
-from SceneScanner import SceneScanner
+import SceneScanner as ss
 import SceneScannerUI as ui
 
+importlib.reload(ss)
 importlib.reload(ui)
 
 # Store in a global so Python doesn't garbage collect it
