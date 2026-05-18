@@ -1,4 +1,4 @@
-# ── SceneScanner.py ──────────────────────────────────────────
+# ── pbr_tools.py ──────────────────────────────────────────
 # Handles all Maya-side logic for the PBR ML Classifier.
 #
 # Responsibilities:
@@ -23,7 +23,7 @@ import maya.cmds as cmds
 from classifier import predict
 
 
-class SceneScanner:
+class PBRTools:
     def __init__(self):
         self.objects = []   # list of transform node paths to scan
         self.results = {}   # filled by scan_and_classify(), read by organize_textures()
@@ -180,7 +180,7 @@ class SceneScanner:
                 # Capture the shader name so we can return it —
                 # this avoids traversing the shading network a second time
                 shader_name = shader
-                print(f"[SceneScanner] Tagged {shader} → {label} ({confidence*100:.1f}%)")
+                print(f"[pbr_tools] Tagged {shader} → {label} ({confidence*100:.1f}%)")
 
         return shader_name
 
@@ -226,7 +226,7 @@ class SceneScanner:
         # Objects with no texture go straight to results as unknown
         for transform in unclassifiable:
             short = transform.split("|")[-1]
-            print(f"[SceneScanner] No albedo found for {short} — skipping")
+            print(f"[pbr_tools] No albedo found for {short} — skipping")
             self.results[transform] = {
                 "label":       "unknown",
                 "confidence":  0.0,
@@ -265,7 +265,7 @@ class SceneScanner:
 
             # Handle any prediction that came back as an error
             if not prediction or "error" in prediction:
-                print(f"[SceneScanner] Inference failed for {short}")
+                print(f"[pbr_tools] Inference failed for {short}")
                 self.results[transform] = {
                     "label":       "error",
                     "confidence":  0.0,
@@ -293,7 +293,7 @@ class SceneScanner:
                 "shader":      shader,
             }
 
-            print(f"[SceneScanner] {short} → {label} ({confidence*100:.1f}%)")
+            print(f"[pbr_tools] {short} → {label} ({confidence*100:.1f}%)")
 
         return self.results
 
@@ -337,12 +337,12 @@ class SceneScanner:
         # ── Step 1: validate the output directory ────────────────────
 
         if not output_dir:
-            print("[SceneScanner] No output directory specified.")
+            print("[pbr_tools] No output directory specified.")
             return {"moved": 0, "skipped": 0, "failed": 0}
 
         textures_root = os.path.normpath(output_dir)
 
-        print(f"[SceneScanner] Organizing textures into: {textures_root}")
+        print(f"[pbr_tools] Organizing textures into: {textures_root}")
 
         # ── Step 2: collect unique texture paths and their labels ─────
 
@@ -369,7 +369,7 @@ class SceneScanner:
             path_to_label[normalized_path] = label
 
         if not path_to_label:
-            print("[SceneScanner] No classified textures found to organize.")
+            print("[pbr_tools] No classified textures found to organize.")
             return {"moved": 0, "skipped": 0, "failed": 0}
 
         total   = len(path_to_label)
@@ -406,7 +406,7 @@ class SceneScanner:
             # Check if the file is already sitting in the right category folder.
             # This happens if organize has been run before on the same scene.
             if src_path == dest_path:
-                print(f"[SceneScanner] Already organized: {os.path.basename(src_path)}")
+                print(f"[pbr_tools] Already organized: {os.path.basename(src_path)}")
                 skipped += 1
                 continue
 
@@ -414,7 +414,7 @@ class SceneScanner:
             # This can happen when two textures from different folders have the
             # same filename. We skip rather than silently overwrite.
             if os.path.exists(dest_path):
-                print(f"[SceneScanner] Skipping — file already exists at destination: {dest_path}")
+                print(f"[pbr_tools] Skipping — file already exists at destination: {dest_path}")
                 skipped += 1
                 continue
 
@@ -425,12 +425,12 @@ class SceneScanner:
                 shutil.move(src_path, dest_path)
                 old_to_new[src_path] = dest_path
                 moved += 1
-                print(f"[SceneScanner] Moved → {label}/{os.path.basename(src_path)}")
+                print(f"[pbr_tools] Moved → {label}/{os.path.basename(src_path)}")
 
             except Exception as error:
                 # If the move fails (e.g. file is locked, permissions issue),
                 # log the error and continue rather than stopping the whole batch.
-                print(f"[SceneScanner] Failed to move {os.path.basename(src_path)}: {error}")
+                print(f"[pbr_tools] Failed to move {os.path.basename(src_path)}: {error}")
                 failed += 1
 
         # ── Step 4: update Maya's file texture nodes ──────────────────
@@ -443,7 +443,7 @@ class SceneScanner:
         # because multiple file nodes can point to the same texture file.
 
         if old_to_new:
-            print("[SceneScanner] Updating Maya file texture paths...")
+            print("[pbr_tools] Updating Maya file texture paths...")
 
             # Get every file texture node currently in the scene
             all_file_nodes = cmds.ls(type="file") or []
@@ -466,7 +466,7 @@ class SceneScanner:
                     # Maya will immediately try to load the texture from the new
                     # location, so the viewport updates as soon as this runs.
                     cmds.setAttr(f"{file_node}.fileTextureName", new_path, type="string")
-                    print(f"[SceneScanner] Updated file node '{file_node}' → {new_path}")
+                    print(f"[pbr_tools] Updated file node '{file_node}' → {new_path}")
 
             # Also update self.results so the UI reflects the new paths
             # without needing a full re-scan.
@@ -480,7 +480,7 @@ class SceneScanner:
         # ── Step 5: report results ────────────────────────────────────
 
         print(
-            f"[SceneScanner] Organization complete — "
+            f"[pbr_tools] Organization complete — "
             f"{moved} moved, {skipped} skipped, {failed} failed"
         )
 

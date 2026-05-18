@@ -1,45 +1,33 @@
 # ── config.py ────────────────────────────────────────────────
-# Central configuration for the PBR ML Classifier.
-#
-# This is the only file that needs to change if you move the
-# project to a different machine or folder. Everything else
-# imports from here so there is no path hardcoding anywhere else.
+# Central config for the PBR Material Classifier.
+# The only file that needs updating if you move the project
+# to a new machine or Maya version.
 #
 # Imported by:
-#   classifier.py   — needs CKPT_PATH, CLASSES, IMAGE_SIZE
-#   SceneScanner.py — needs INFER_SCRIPT, PYTHON_EXE
+#   classifier.py  — needs CKPT_PATH, CLASSES, IMAGE_SIZE
+#   pbr_tools.py   — no direct import, but PYTHON_EXE is documented here
 # ─────────────────────────────────────────────────────────────
 
 import os
 import sys
+import platform
 
-# ── Folder location ───────────────────────────────────────────
-# __file__ is the path to this config.py file.
-# dirname gives us the folder it lives in.
-# All other paths are built relative to this folder so the
-# project works on any machine without manual path setup.
+# Folder this file lives in — all other paths are relative to it
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── File paths ────────────────────────────────────────────────
-
-# The trained model weights exported from Colab
+# Trained model checkpoint exported from Colab
 CKPT_PATH = os.path.join(SCRIPTS_DIR, "pbr_classifier.pth")
 
-# The command line inference script — used for testing outside Maya
-INFER_SCRIPT = os.path.join(SCRIPTS_DIR, "infer.py")
+# Maya's own Python executable.
+# Executable name differs by OS: mayapy.exe on Windows, mayapy on macOS.
+# sys.executable points to maya.exe / maya when running inside Maya,
+# so swapping the filename gives us mayapy in the same bin folder.
+_mayapy_exe = "mayapy.exe" if platform.system() == "Windows" else "mayapy"
+MAYA_BIN    = os.path.dirname(sys.executable)
+PYTHON_EXE  = os.path.join(MAYA_BIN, _mayapy_exe)
 
-# ── Maya Python executable ────────────────────────────────────
-# mayapy.exe lives in the same bin folder as maya.exe.
-# sys.executable gives us the path to maya.exe when running
-# inside Maya, so we just swap the filename to get mayapy.exe.
-MAYA_BIN   = os.path.dirname(sys.executable)
-PYTHON_EXE = os.path.join(MAYA_BIN, "mayapy.exe")
-
-# ── Model settings ────────────────────────────────────────────
-
-# The five material categories the model was trained to recognise.
-# Order must match the class order used during training.
+# Material categories — order must match the training class order
 CLASSES = ["fabric", "ground", "metal", "rock", "wood"]
 
-# Input image size the model expects — set during training
+# Image size the model expects (set during training)
 IMAGE_SIZE = 224

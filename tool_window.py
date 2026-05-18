@@ -1,4 +1,4 @@
-# ── SceneScannerUI.py ────────────────────────────────────────
+# ── tool_window.py ────────────────────────────────────────
 # PySide6 tool window for the PBR ML Classifier.
 # Parented to Maya's main window so it behaves as a native panel.
 #
@@ -19,7 +19,7 @@ from maya import OpenMayaUI as omui
 from shiboken6 import wrapInstance
 import maya.cmds as cmds
 
-from SceneScanner import SceneScanner
+from pbr_tools import PBRTools
 
 # The full list of filter options shown in the dropdown.
 # "all" shows every result; the rest filter by that material category.
@@ -44,7 +44,7 @@ def get_maya_main_window():
     return wrapInstance(int(ptr), QtWidgets.QWidget)
 
 
-class SceneScannerUI(QtWidgets.QWidget):
+class ToolWindow(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         if parent is None:
@@ -52,7 +52,7 @@ class SceneScannerUI(QtWidgets.QWidget):
         super().__init__(parent)
 
         # The scanner handles all Maya logic — the UI just calls its methods
-        self.scanner = SceneScanner()
+        self.tools = PBRTools()
 
         # Flat list of result dicts built after each scan, used to populate the table
         self.all_results = []
@@ -223,7 +223,7 @@ class SceneScannerUI(QtWidgets.QWidget):
         Triggered when the artist clicks 'Scan Scene'.
         Tells the scanner to collect every mesh in the scene, then classifies them.
         """
-        self.scanner.get_all_scene_meshes()
+        self.tools.get_all_scene_meshes()
         self._run_classify()
 
     def run_scan_selection(self):
@@ -231,7 +231,7 @@ class SceneScannerUI(QtWidgets.QWidget):
         Triggered when the artist clicks 'Scan Selection'.
         Tells the scanner to collect only the selected meshes, then classifies them.
         """
-        self.scanner.get_selected_meshes()
+        self.tools.get_selected_meshes()
         self._run_classify()
 
     def _run_classify(self):
@@ -240,7 +240,7 @@ class SceneScannerUI(QtWidgets.QWidget):
         Updates the status bar as each object is processed, then populates the table.
         """
 
-        total = len(self.scanner.objects)
+        total = len(self.tools.objects)
 
         if total == 0:
             self.status_label.setText("No mesh objects found.")
@@ -266,7 +266,7 @@ class SceneScannerUI(QtWidgets.QWidget):
             QtWidgets.QApplication.processEvents()
 
         t0      = time.monotonic()
-        results = self.scanner.scan_and_classify(progress_callback=on_progress)
+        results = self.tools.scan_and_classify(progress_callback=on_progress)
         elapsed = time.monotonic() - t0
 
         # Convert the results dict into a flat list of entry dicts for the table.
@@ -428,7 +428,7 @@ class SceneScannerUI(QtWidgets.QWidget):
         # ── Step 1: check there is something to move ─────────
 
         movable_paths = set()
-        for data in self.scanner.results.values():
+        for data in self.tools.results.values():
             path  = data.get("albedo_path")
             label = data.get("label")
             if path and label not in (None, "unknown", "error"):
@@ -494,7 +494,7 @@ class SceneScannerUI(QtWidgets.QWidget):
             self.status_label.setText(f"Moving {current} / {total} — {filename}")
             QtWidgets.QApplication.processEvents()
 
-        summary = self.scanner.organize_textures(
+        summary = self.tools.organize_textures(
             output_dir=chosen_dir,
             progress_callback=on_organize_progress,
         )
@@ -505,7 +505,7 @@ class SceneScannerUI(QtWidgets.QWidget):
 
         # Refresh detail panel paths from updated results
         for entry in self.all_results:
-            updated  = self.scanner.results.get(entry["transform"], {})
+            updated  = self.tools.results.get(entry["transform"], {})
             new_path = updated.get("albedo_path")
             if new_path:
                 entry["albedo_path"] = new_path
