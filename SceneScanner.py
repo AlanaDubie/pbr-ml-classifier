@@ -2,16 +2,19 @@
 # Handles all Maya-side logic for the PBR ML Classifier.
 #
 # Responsibilities:
-#   1. Mesh collection  — find objects in the scene or selection
+#   1. Mesh collection   — find objects in the scene or selection
 #   2. Albedo extraction — find texture file paths from shading networks
-#   3. Classification   — call classifier.predict() for each texture
-#   4. Metadata writing — stamp results onto shader nodes in the scene
+#   3. Classification    — call classifier.predict() for each texture
+#   4. Metadata writing  — stamp results onto shader nodes in the scene
+#   5. File organization — move textures into category subfolders on disk
+#                          and update Maya's file nodes to point to the new paths
 #
 # This file only deals with Maya — no ML code lives here.
 # All inference is handled by classifier.py.
 # ─────────────────────────────────────────────────────────────
 
 import os
+import shutil
 import maya.cmds as cmds
 
 # Import the predict function from classifier.py.
@@ -19,10 +22,11 @@ import maya.cmds as cmds
 # so importing this here does not slow down Maya startup.
 from classifier import predict
 
+
 class SceneScanner:
     def __init__(self):
         self.objects = []   # list of transform node paths to scan
-        self.results = {}   # filled by scan_and_classify()
+        self.results = {}   # filled by scan_and_classify(), read by organize_textures()
 
     # ── Mesh collection ──────────────────────────────────────
 
@@ -162,7 +166,7 @@ class SceneScanner:
 
                 # Only add the attribute if it does not already exist.
                 # Without this check, running the tool twice on the same
-                # scene would throw an error because the attribute exists.
+                # scene would throw an error because the attribute already exists.
                 if not cmds.attributeQuery("materialType", node=shader, exists=True):
                     cmds.addAttr(shader, longName="materialType",
                                  dataType="string", keyable=False)
@@ -173,7 +177,7 @@ class SceneScanner:
                                  attributeType="float", keyable=False)
                 cmds.setAttr(f"{shader}.mlConfidence", confidence)
 
-                # Capture the shader name here so we can return it —
+                # Capture the shader name so we can return it —
                 # this avoids traversing the shading network a second time
                 shader_name = shader
                 print(f"[SceneScanner] Tagged {shader} → {label} ({confidence*100:.1f}%)")
@@ -292,3 +296,192 @@ class SceneScanner:
             print(f"[SceneScanner] {short} → {label} ({confidence*100:.1f}%)")
 
         return self.results
+
+    # ── File organization ────────────────────────────────────
+
+    def organize_textures(self, output_dir, progress_callback=None):
+        """
+        Move each classified texture into a category subfolder on disk,
+        then update Maya's file texture nodes to point to the new location.
+
+        This should only be called AFTER scan_and_classify() has been run,
+        because it reads from self.results to know which label each texture got.
+
+        output_dir is the root folder chosen by the user. Category subfolders
+        are created inside it automatically:
+            <output_dir>/
+                wood/
+                    oak_planks_color.png
+                metal/
+                    rust_01_color.png
+                rock/  ground/  fabric/  ...
+
+        Why update Maya's file nodes?
+        If we just move the file and don't tell Maya, every texture in the
+        scene goes missing — the red X problem. We call cmds.setAttr() on
+        every file texture node that referenced the old path so the scene
+        stays intact after the move.
+
+        Why deduplicate?
+        Multiple objects can share the same texture file. We only move each
+        unique file once, then update all nodes that referenced it together.
+
+        Returns a summary dict:
+            {
+                "moved":   5,   — number of files successfully moved
+                "skipped": 1,   — files that were already in the right place
+                "failed":  0,   — files that could not be moved (permissions etc.)
+            }
+        """
+
+        # ── Step 1: validate the output directory ────────────────────
+
+        if not output_dir:
+            print("[SceneScanner] No output directory specified.")
+            return {"moved": 0, "skipped": 0, "failed": 0}
+
+        textures_root = os.path.normpath(output_dir)
+
+        print(f"[SceneScanner] Organizing textures into: {textures_root}")
+
+        # ── Step 2: collect unique texture paths and their labels ─────
+
+        # Build a mapping of  texture_path → label
+        # from the results that scan_and_classify() already stored.
+        #
+        # We use a dict here (not a list) so that if two objects share
+        # the same texture file, we only store that path once.
+        # The label will be the same either way since the same image
+        # would have been classified the same way.
+        path_to_label = {}
+
+        for transform, data in self.results.items():
+            albedo_path = data.get("albedo_path")
+            label       = data.get("label")
+
+            # Skip objects that had no texture or failed classification
+            if not albedo_path or label in (None, "unknown", "error"):
+                continue
+
+            # os.path.normpath normalises slashes so the same file referenced
+            # with different slash styles doesn't appear as two separate entries
+            normalized_path = os.path.normpath(albedo_path)
+            path_to_label[normalized_path] = label
+
+        if not path_to_label:
+            print("[SceneScanner] No classified textures found to organize.")
+            return {"moved": 0, "skipped": 0, "failed": 0}
+
+        total   = len(path_to_label)
+        moved   = 0
+        skipped = 0
+        failed  = 0
+
+        # ── Step 3: move each unique texture into its category folder ──
+
+        # old_to_new stores the path remapping so we can update Maya's
+        # file nodes in one pass after all files have been moved.
+        # Format:  { old_path_str: new_path_str }
+        old_to_new = {}
+
+        for index, (src_path, label) in enumerate(path_to_label.items()):
+
+            if progress_callback:
+                filename = os.path.basename(src_path)
+                progress_callback(index + 1, total, filename)
+
+            # Build the destination folder: textures/wood/, textures/metal/, etc.
+            dest_folder = os.path.join(textures_root, label)
+
+            # os.makedirs creates the full folder path including any missing
+            # parent folders. exist_ok=True means no error if it already exists.
+            os.makedirs(dest_folder, exist_ok=True)
+
+            # The destination file path keeps the original filename intact
+            dest_path = os.path.join(dest_folder, os.path.basename(src_path))
+
+            # Normalise the destination path for consistent comparisons
+            dest_path = os.path.normpath(dest_path)
+
+            # Check if the file is already sitting in the right category folder.
+            # This happens if organize has been run before on the same scene.
+            if src_path == dest_path:
+                print(f"[SceneScanner] Already organized: {os.path.basename(src_path)}")
+                skipped += 1
+                continue
+
+            # Check if a file with the same name already exists at the destination.
+            # This can happen when two textures from different folders have the
+            # same filename. We skip rather than silently overwrite.
+            if os.path.exists(dest_path):
+                print(f"[SceneScanner] Skipping — file already exists at destination: {dest_path}")
+                skipped += 1
+                continue
+
+            # Move the file from its current location to the category folder.
+            # shutil.move handles files across different drives correctly,
+            # unlike os.rename which only works on the same filesystem.
+            try:
+                shutil.move(src_path, dest_path)
+                old_to_new[src_path] = dest_path
+                moved += 1
+                print(f"[SceneScanner] Moved → {label}/{os.path.basename(src_path)}")
+
+            except Exception as error:
+                # If the move fails (e.g. file is locked, permissions issue),
+                # log the error and continue rather than stopping the whole batch.
+                print(f"[SceneScanner] Failed to move {os.path.basename(src_path)}: {error}")
+                failed += 1
+
+        # ── Step 4: update Maya's file texture nodes ──────────────────
+
+        # After moving files, every file texture node in the scene that
+        # referenced an old path must be updated to the new path.
+        # Without this step, Maya shows the red X missing texture warning.
+        #
+        # We query ALL file nodes in the scene, not just the ones from the scan,
+        # because multiple file nodes can point to the same texture file.
+
+        if old_to_new:
+            print("[SceneScanner] Updating Maya file texture paths...")
+
+            # Get every file texture node currently in the scene
+            all_file_nodes = cmds.ls(type="file") or []
+
+            for file_node in all_file_nodes:
+                current_path = cmds.getAttr(f"{file_node}.fileTextureName")
+
+                if not current_path:
+                    continue
+
+                # Normalise the path so the comparison works regardless of
+                # forward/back slashes or trailing separators
+                normalized_current = os.path.normpath(current_path)
+
+                # If this node was pointing at a file we moved, update it
+                if normalized_current in old_to_new:
+                    new_path = old_to_new[normalized_current]
+
+                    # setAttr updates the file node's path inside Maya.
+                    # Maya will immediately try to load the texture from the new
+                    # location, so the viewport updates as soon as this runs.
+                    cmds.setAttr(f"{file_node}.fileTextureName", new_path, type="string")
+                    print(f"[SceneScanner] Updated file node '{file_node}' → {new_path}")
+
+            # Also update self.results so the UI reflects the new paths
+            # without needing a full re-scan.
+            for transform, data in self.results.items():
+                old_path = data.get("albedo_path")
+                if old_path:
+                    normalized_old = os.path.normpath(old_path)
+                    if normalized_old in old_to_new:
+                        self.results[transform]["albedo_path"] = old_to_new[normalized_old]
+
+        # ── Step 5: report results ────────────────────────────────────
+
+        print(
+            f"[SceneScanner] Organization complete — "
+            f"{moved} moved, {skipped} skipped, {failed} failed"
+        )
+
+        return {"moved": moved, "skipped": skipped, "failed": failed}
