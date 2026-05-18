@@ -1,7 +1,7 @@
 # ── SceneScannerUI.py ────────────────────────────────────────
 # PySide6 tool window for the PBR ML Classifier.
 # Parented to Maya's main window so it behaves as a native panel.
-# Plain Maya-style UI — no custom colours or styling.
+# Maya-style UI
 # ─────────────────────────────────────────────────────────────
 
 from PySide6 import QtWidgets, QtCore
@@ -12,11 +12,9 @@ from SceneScanner import SceneScanner
 
 CATEGORIES = ["all", "wood", "rock", "metal", "ground", "fabric"]
 
-
 def get_maya_main_window():
     ptr = omui.MQtUtil.mainWindow()
     return wrapInstance(int(ptr), QtWidgets.QWidget)
-
 
 class SceneScannerUI(QtWidgets.QWidget):
     def __init__(self, parent=None):
@@ -30,7 +28,7 @@ class SceneScannerUI(QtWidgets.QWidget):
 
         self.setWindowTitle("PBR Material Classifier")
         self.setMinimumWidth(420)
-        self.setMinimumHeight(500)
+        self.setMinimumHeight(650)
         self.setWindowFlags(QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
 

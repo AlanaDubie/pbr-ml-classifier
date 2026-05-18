@@ -1,7 +1,6 @@
 # PBR Machine-Learning CNN Texture Classifier & File Orginization
 
-**PBR ML Classifier** is a Maya Python tool that uses a model to classify textures in a scene automatically assigns tags to the meshes and orginizes the textures. 
----
+**PBR ML Classifier** is a Maya Python tool that uses a model to classify textures in a scene, automatically assigns tags to the meshes, and organizes the textures.
 
 ### Features
 
