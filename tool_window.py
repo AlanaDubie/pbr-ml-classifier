@@ -51,10 +51,13 @@ class ToolWindow(QtWidgets.QWidget):
             parent = get_maya_main_window()
         super().__init__(parent)
 
-        # The scanner handles all Maya logic — the UI just calls its methods
+        # The tools object handles all Maya logic — the UI just calls its methods
         self.tools = PBRTools()
 
-        # Flat list of result dicts built after each scan, used to populate the table
+        # Flat list of result dicts built after each scan, used to populate the table.
+        # Each entry stores the transform key and static scan-time values (label,
+        # confidence, scores). The albedo_path is always read live from
+        # self.tools.results at click time — see _on_row_clicked().
         self.all_results = []
 
         # Which category the filter dropdown is currently set to
@@ -269,19 +272,22 @@ class ToolWindow(QtWidgets.QWidget):
         results = self.tools.scan_and_classify(progress_callback=on_progress)
         elapsed = time.monotonic() - t0
 
-        # Convert the results dict into a flat list of entry dicts for the table.
-        # We store everything the UI might need so we don't have to re-query
-        # the scanner when the artist clicks a row or changes the filter.
+        # Build a flat list of entry dicts for the table.
+        # We only store static scan-time values here (label, confidence, scores).
+        # The albedo_path is intentionally NOT stored here — it is always read
+        # live from self.tools.results at click time in _on_row_clicked().
+        # This guarantees the detail panel always shows the current path, even
+        # after organize_textures() has moved files and updated the results dict.
         for transform, data in results.items():
             short = transform.split("|")[-1]   # just the node name, not the full path
             entry = {
-                "transform":   transform,
-                "short":       short,
-                "label":       data.get("label", "unknown"),
-                "confidence":  data.get("confidence", 0.0),
-                "albedo_path": data.get("albedo_path", ""),
-                "all_scores":  data.get("all_scores", {}),
-                "shader":      data.get("shader", "—"),
+                "transform":  transform,
+                "short":      short,
+                # Static values — won't change after a scan
+                "label":      data.get("label", "unknown"),
+                "confidence": data.get("confidence", 0.0),
+                "all_scores": data.get("all_scores", {}),
+                "shader":     data.get("shader", "—"),
             }
             self.all_results.append(entry)
 
@@ -321,6 +327,11 @@ class ToolWindow(QtWidgets.QWidget):
         """
         Fill the results table from self.all_results, applying the active filter.
         Called after every scan and every time the filter dropdown changes.
+
+        Each row stores the transform key (not the full entry dict) via UserRole.
+        _on_row_clicked() uses that key to look up live data from self.tools.results,
+        so the detail panel always shows the current albedo_path — even after
+        organize_textures() has moved files and updated the results dict.
         """
 
         self.table.clear()
@@ -347,9 +358,13 @@ class ToolWindow(QtWidgets.QWidget):
                 confidence_str,
             ])
 
-            # Store the full entry dict on the row so _on_row_clicked()
-            # can retrieve it without searching through all_results again
-            row.setData(0, QtCore.Qt.UserRole, entry)
+            # Store only the transform key on the row — NOT a snapshot of the
+            # entry dict. This is the fix for the stale path bug:
+            # _on_row_clicked() will use this key to look up the current data
+            # from self.tools.results every single time the row is clicked,
+            # so it always reflects the latest albedo_path regardless of whether
+            # organize_textures() has run since the table was last built.
+            row.setData(0, QtCore.Qt.UserRole, entry["transform"])
 
             self.table.addTopLevelItem(row)
 
@@ -368,19 +383,26 @@ class ToolWindow(QtWidgets.QWidget):
         """
         Triggered when the artist clicks a row in the results table.
         Populates the detail panel with the texture path and per-class scores.
+
+        Why do we look up self.tools.results here instead of reading from the row?
+        Each row only stores the transform key (set in _populate_table).
+        We intentionally do NOT cache the albedo_path in the row because
+        organize_textures() updates self.tools.results with new paths after moving
+        files. By looking up the live dict every time the row is clicked, the
+        detail panel always shows the current path — never a stale one.
         """
 
-        entry = item.data(0, QtCore.Qt.UserRole)
-        if not entry:
+        # Retrieve the transform key stored on this row at table-build time
+        transform = item.data(0, QtCore.Qt.UserRole)
+        if not transform:
             return
 
-        self.detail_object.setText(entry["short"])
-        self.detail_shader.setText(entry.get("shader") or "—")
-        self.detail_path.setText(entry.get("albedo_path") or "no texture connected")
+        # Look up the LIVE result dict — always current, never stale
+        live_data = self.tools.results.get(transform, {})
 
         # Build the scores string — sorted highest to lowest so the
         # most likely categories appear at the top
-        scores = entry.get("all_scores", {})
+        scores = live_data.get("all_scores", {})
         if scores:
             score_lines = [
                 f"{category}: {value * 100:.1f}%"
@@ -390,6 +412,9 @@ class ToolWindow(QtWidgets.QWidget):
         else:
             score_str = "—"
 
+        self.detail_object.setText(transform.split("|")[-1])
+        self.detail_shader.setText(live_data.get("shader") or "—")
+        self.detail_path.setText(live_data.get("albedo_path") or "no texture connected")
         self.detail_scores.setText(score_str)
         self.detail_group.setVisible(True)
 
@@ -421,7 +446,7 @@ class ToolWindow(QtWidgets.QWidget):
           1. Check there are classified textures to move.
           2. Read the destination path from the path field.
           3. One confirmation dialog — shows the path, Move Files / Cancel.
-          4. Run and report result in the status bar.
+          4. Run organize_textures() and report result in the status bar.
              Only shows a second dialog if files actually failed to move.
         """
 
@@ -478,7 +503,7 @@ class ToolWindow(QtWidgets.QWidget):
 
         move_button   = confirm.addButton("Move Files", QtWidgets.QMessageBox.AcceptRole)
         cancel_button = confirm.addButton("Cancel",     QtWidgets.QMessageBox.RejectRole)
-        confirm.setDefaultButton(cancel_button)
+        confirm.setDefaultButton(cancel_button)   # Cancel is default — safer for destructive actions
         confirm.exec()
 
         if confirm.clickedButton() == cancel_button:
@@ -491,6 +516,10 @@ class ToolWindow(QtWidgets.QWidget):
         QtWidgets.QApplication.processEvents()
 
         def on_organize_progress(current, total, filename):
+            """
+            Called by organize_textures() after each file is moved.
+            Keeps the status bar updated so the artist sees progress on large sets.
+            """
             self.status_label.setText(f"Moving {current} / {total} — {filename}")
             QtWidgets.QApplication.processEvents()
 
@@ -503,12 +532,21 @@ class ToolWindow(QtWidgets.QWidget):
         skipped = summary.get("skipped", 0)
         failed  = summary.get("failed",  0)
 
-        # Refresh detail panel paths from updated results
-        for entry in self.all_results:
-            updated  = self.tools.results.get(entry["transform"], {})
-            new_path = updated.get("albedo_path")
-            if new_path:
-                entry["albedo_path"] = new_path
+        # Refresh the detail panel if it's currently open.
+        # Because _on_row_clicked() always reads live from self.tools.results,
+        # we just need to re-call the display logic for the currently shown object.
+        # We identify it by the short name shown in the detail_object label.
+        if self.detail_group.isVisible():
+            shown_short = self.detail_object.text()
+            for entry in self.all_results:
+                if entry["short"] == shown_short:
+                    # Look up the live result dict — albedo_path is already updated
+                    # by organize_textures() inside self.tools.results
+                    live_data = self.tools.results.get(entry["transform"], {})
+                    self.detail_path.setText(
+                        live_data.get("albedo_path") or "no texture connected"
+                    )
+                    break
 
         # Report in the status bar — no popup needed on success
         parts = []
@@ -518,11 +556,13 @@ class ToolWindow(QtWidgets.QWidget):
             parts.append(f"{skipped} already organized")
         if failed:
             parts.append(f"{failed} failed")
-        self.status_label.setText("Done — " + (", ".join(parts) if parts else "nothing to move"))
+        self.status_label.setText(
+            "Done — " + (", ".join(parts) if parts else "nothing to move")
+        )
 
         self.organize_btn.setEnabled(True)
 
-        # Only interrupt the artist if something actually went wrong
+        # Only interrupt the artist with a dialog if something actually went wrong
         if failed > 0:
             QtWidgets.QMessageBox.warning(
                 self,

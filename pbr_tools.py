@@ -32,23 +32,73 @@ class PBRTools:
 
     def get_selected_meshes(self):
         """
-        Return only the mesh transforms the artist has selected
-        in the Maya viewport.
+        Return all mesh transforms found in the current selection,
+        including meshes inside groups and deeply nested hierarchies.
+
+        Why recursive?
+        When an artist selects a group, Maya only returns the group
+        transform — not the meshes inside it. A simple shapes check
+        on the group itself finds nothing because the meshes are
+        children of children. We recurse all the way down the
+        hierarchy to find every mesh regardless of nesting depth.
+
+        Examples that all work:
+          - Selecting a mesh directly       → finds it
+          - Selecting a group with meshes   → finds all meshes inside
+          - Selecting a nested group        → finds all meshes at any depth
+          - Mixed selection of groups + meshes → finds everything
         """
 
-        # ls() with selection=True returns everything currently selected
-        selection = cmds.ls(selection=True, long=True, type="transform")
+        # ls() returns everything currently selected in the viewport
+        selection = cmds.ls(selection=True, long=True)
 
+        # Collect all mesh transforms found under the selection
         meshes = []
-        for obj in selection:
-            # Transforms can hold cameras, lights, locators etc.
-            # We only want transforms that have a mesh shape as a child.
-            shapes = cmds.listRelatives(obj, shapes=True, fullPath=True) or []
-            if shapes:
-                meshes.append(obj)
 
-        self.objects = meshes
-        return meshes
+        for obj in selection:
+            # _collect_meshes_recursive walks the full hierarchy
+            # under obj and appends any mesh transforms it finds
+            self._collect_meshes_recursive(obj, meshes)
+
+        # Remove duplicates — selecting both a group and a mesh inside
+        # it would otherwise add that mesh twice
+        seen = set()
+        unique_meshes = []
+        for m in meshes:
+            if m not in seen:
+                seen.add(m)
+                unique_meshes.append(m)
+
+        self.objects = unique_meshes
+        return unique_meshes
+
+    def _collect_meshes_recursive(self, transform, results):
+        """
+        Walk down the hierarchy from transform and add any mesh
+        transforms found to the results list.
+
+        Called recursively so it handles any depth of nesting:
+          group1
+            group2
+              mesh1   ← found
+              mesh2   ← found
+            mesh3     ← found
+        """
+
+        # Check if this transform directly has a mesh shape under it
+        shapes = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
+        has_mesh = any(
+            cmds.nodeType(s) == "mesh" for s in shapes
+        )
+        if has_mesh:
+            results.append(transform)
+
+        # Recurse into any child transforms (groups, nested meshes etc.)
+        children = cmds.listRelatives(
+            transform, children=True, fullPath=True, type="transform"
+        ) or []
+        for child in children:
+            self._collect_meshes_recursive(child, results)
 
     def get_all_scene_meshes(self):
         """
@@ -180,7 +230,7 @@ class PBRTools:
                 # Capture the shader name so we can return it —
                 # this avoids traversing the shading network a second time
                 shader_name = shader
-                print(f"[pbr_tools] Tagged {shader} → {label} ({confidence*100:.1f}%)")
+                print(f"[pbr_tools] tagged {shader} → {label} ({confidence*100:.1f}%)")
 
         return shader_name
 
