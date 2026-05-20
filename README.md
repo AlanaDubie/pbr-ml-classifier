@@ -1,19 +1,51 @@
-# PBR Material Classifier — Automatic Texture Tagger for Maya
+# PBR Material Classifier — ML-Assisted Texture Pipeline Tool for Maya
 
-A Maya tool that looks at the textures on objects in your scene and uses a machine learning model to identify what type of material each one is (wood, rock, metal, ground, or fabric). It tags each material with their type and then automatically sorts texture files into organized category folders on disk.
+A Maya pipeline tool that analyzes shader networks and uses a lightweight machine learning classifier to assist in identifying material types from albedo textures (wood, rock, metal, ground, fabric).
+
+The system integrates directly into Maya scenes to tag shader nodes with material metadata and confidence scores, and supports automated organization of texture assets into structured, publish-ready directory layouts for improved asset management and pipeline consistency.
 
 ---
 
 ## Features
 
-- Looks at the colour texture on each object and predicts which of **5 material types** it is: wood, rock, metal, ground, or fabric
-- Tags each shader in the scene with the predicted material type and a confidence score
-- Moves texture files into named category folders (`textures/wood/`, `textures/metal/`, etc.) and updates all the file paths inside Maya automatically
-- Option to scan every object in the scene at once, or just selected objects
-- View each mesh's texture path and confidence level across all five categories
-- Type in or browse to any folder on your machine as the destination for the sorted textures
+### Shader & Scene Analysis
+- Traverses Maya shading networks (shading engine → shader → file texture nodes)
+- Extracts **albedo textures** from connected materials
+- Supports full scene or selection-based processing
+- Recursively resolves nested hierarchy selections
+
+### ML-Assisted Classification
+- Predicts one of five material categories: wood, rock, metal, ground, fabric
+- Outputs:
+  - predicted label
+  - confidence score
+  - full class probability breakdown
+- Lightweight inference using a ResNet-18 model trained on curated PBR datasets
+
+### Scene Integration
+- Tags shaders with:
+  - `materialType` (string attribute)
+  - `mlConfidence` (float attribute)
+- Stores metadata directly in Maya scene files for persistence
+
+### Texture Pipeline & Publishing
+- Organizes textures into structured category folders:
+
+```
+textures/
+  ├── wood/
+  ├── rock/
+  ├── metal/
+  ├── ground/
+  └── fabric/
+```
+- Deduplicates shared texture usage across multiple objects
+- Updates Maya file nodes after relocation to preserve scene integrity
+- Supports custom output directory for asset publishing workflows
+
 
 ---
+
 
 ## Requirements
 
@@ -32,13 +64,12 @@ Maya's embedded Python interpreter cannot import PyTorch directly. The ML layer 
 - **`pbr_tools.py`** handles all Maya-side logic: mesh collection, texture extraction, metadata writing, and file organization
 - **`tool_window.py`** is the PySide6 tool window parented to Maya's main window
 
-NOTE: Only albedo maps are used as classifier input 
 
 ---
 
 ## Dataset
 
-The training dataset was collected from AmbientCG and Poly Haven's PBR texture libraries using their public APIs.
+The model was trained on a curated dataset of PBR textures sourced from AmbientCG and Poly Haven with CC0 liscense.
 
 | Category | Images |
 |----------|--------|
@@ -75,15 +106,13 @@ Training runs on Google Colab (free T4 GPU runtime) and exports a `.pth` checkpo
     C:\Users\<YourUsername>\Documents\maya\<MayaVersion>\scripts\pbr-ml-classifier\
     ```
 
-2. Place `pbr_classifier.pth` in the same folder. Download it from the Colab link above, or train your own.
-
-3. Open Maya, go to the **Script Editor**, and run this in the **MEL tab** to enable the command port:
+2. Open Maya, go to the **Script Editor**, and run this in the **MEL tab** to enable the command port:
 
     ```mel
     commandPort -name "localhost:7001" -sourceType "mel" -echoOutput;
     ```
 
-4. In the **Python tab**, run `launch.py` to open the tool. You can also paste its contents into a **shelf button** for one-click access.
+3. In the **Python tab**, run `launch.py` to open the tool. You can also paste its contents into a **shelf button** for one-click access.
 
 ---
 
