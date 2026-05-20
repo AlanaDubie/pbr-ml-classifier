@@ -1,14 +1,22 @@
-# ── tool_window.py ────────────────────────────────────────
+# ── tool_window.py ────────────────────────────────────────────
 # PySide6 tool window for the PBR ML Classifier.
 # Parented to Maya's main window so it behaves as a native panel.
 #
 # Layout (top to bottom):
-#   1. Scan buttons      — Scan Scene / Scan Selection
-#   2. Organize button   — Organize Textures (disabled until scan runs)
-#   3. Filter dropdown   — filter results by material category
-#   4. Results table     — object name, predicted label, confidence
-#   5. Detail panel      — texture path + per-class score breakdown
-#   6. Status bar        — current operation or last result count
+#   1. Scan buttons       — Scan Scene / Scan Selection
+#   2. Output path field  — destination folder + Browse button
+#   3. Batch controls     — Accept >90%, Reject <50%, Reset, Dry Run toggle
+#   4. Review table       — Object | Predicted | Confidence | Override | Status
+#   5. Footer counts      — accepted / rejected / pending live totals
+#   6. Approve & Organize — applies accepted items only (metadata + file move)
+#   7. Detail panel       — texture path + per-class confidence scores
+#   8. Status bar         — current operation or last result summary
+#
+# Review flow:
+#   Scan → predictions stored (no scene writes yet)
+#   Artist reviews table, changes overrides, sets status per row
+#   Click "Approve & Organize" → only accepted rows get metadata written
+#   and textures moved on disk
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -19,26 +27,30 @@ from maya import OpenMayaUI as omui
 from shiboken6 import wrapInstance
 import maya.cmds as cmds
 
-from pbr_tools import PBRTools
+from pbr_tools import PBRTools, CLASSES
 
-# The full list of filter options shown in the dropdown.
-# "all" shows every result; the rest filter by that material category.
-CATEGORIES = ["all", "wood", "rock", "metal", "ground", "fabric"]
+# Confidence threshold above which a result is auto-accepted after scanning.
+# Items at or above this value start with status="accepted".
+# Items below start with status="pending" so the artist reviews them.
+AUTO_ACCEPT_THRESHOLD = 0.90
+
+# Cycling order when the artist clicks a status chip in the table.
+STATUS_CYCLE = {"pending": "accepted", "accepted": "rejected", "rejected": "pending"}
+
+# Filter options for the dropdown above the table.
+FILTER_OPTIONS = ["all"] + CLASSES
 
 
 def get_maya_main_window():
     """
     Return Maya's main application window as a Qt widget.
 
-    Why do we need this?
-    Maya runs its own Qt application internally. If we create our tool
-    window without parenting it to Maya's window, it behaves like a
-    completely separate application — it won't stay on top, it won't
-    minimize with Maya, and it can get lost behind other windows.
+    Maya runs its own Qt application. Parenting our tool window to it
+    means the window stays on top of Maya, minimizes with it, and
+    behaves like a native panel rather than a separate floating app.
 
     MQtUtil.mainWindow() returns a raw C++ pointer to Maya's window.
-    wrapInstance() converts that pointer into a Python Qt object we
-    can use as a parent.
+    wrapInstance() converts it into a Python Qt object we can parent to.
     """
     ptr = omui.MQtUtil.mainWindow()
     return wrapInstance(int(ptr), QtWidgets.QWidget)
@@ -51,26 +63,29 @@ class ToolWindow(QtWidgets.QWidget):
             parent = get_maya_main_window()
         super().__init__(parent)
 
-        # The tools object handles all Maya logic — the UI just calls its methods
+        # Handles all Maya-side logic — mesh collection, classification,
+        # metadata writing, and file organization.
         self.tools = PBRTools()
 
-        # Flat list of result dicts built after each scan, used to populate the table.
-        # Each entry stores the transform key and static scan-time values (label,
-        # confidence, scores). The albedo_path is always read live from
-        # self.tools.results at click time — see _on_row_clicked().
-        self.all_results = []
+        # Review queue — one dict per scanned object.
+        # Built after each scan, read by the table and apply_approved().
+        # Each entry:
+        #   transform  — full Maya node path (used as a unique key)
+        #   short      — node name only (displayed in the table)
+        #   label      — original ML prediction
+        #   confidence — ML confidence score (0.0 – 1.0)
+        #   all_scores — full per-class breakdown dict
+        #   override   — None, or a string if the artist changed the label
+        #   status     — "pending" | "accepted" | "rejected"
+        self.review_queue = []
 
-        # Which category the filter dropdown is currently set to
+        # Which category the filter dropdown is set to
         self.active_filter = "all"
 
         self.setWindowTitle("PBR Material Classifier")
-        self.setMinimumWidth(420)
-        self.setMinimumHeight(650)
-
-        # Qt.Window makes this a proper floating window instead of an embedded widget
+        self.setMinimumWidth(550)
+        self.setMinimumHeight(800)
         self.setWindowFlags(QtCore.Qt.Window)
-
-        # WA_DeleteOnClose frees memory when the window is closed
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
 
         self._build_ui()
@@ -81,24 +96,29 @@ class ToolWindow(QtWidgets.QWidget):
     def _build_ui(self):
         """
         Build and arrange all widgets in the window.
-        Called once during __init__ — widgets are never rebuilt after that.
+        Called once during __init__ — never rebuilt after that.
         """
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(4)
 
-        # ── Scan buttons ─────────────────────────────────────
-        # Two buttons side by side — scan the whole scene or just the selection
+        # ── Scan buttons ──────────────────────────────────────
 
         scan_row = QtWidgets.QHBoxLayout()
 
         self.scan_scene_btn = QtWidgets.QPushButton("Scan Scene")
-        self.scan_scene_btn.setToolTip("Classify all mesh objects in the scene")
+        self.scan_scene_btn.setToolTip(
+            "Classify all mesh objects in the scene.\n"
+            "Results appear in the review table — nothing is written until you approve."
+        )
         self.scan_scene_btn.clicked.connect(self.run_scan_scene)
 
         self.scan_selection_btn = QtWidgets.QPushButton("Scan Selection")
-        self.scan_selection_btn.setToolTip("Classify only the currently selected mesh objects")
+        self.scan_selection_btn.setToolTip(
+            "Classify only the currently selected mesh objects.\n"
+            "Results appear in the review table — nothing is written until you approve."
+        )
         self.scan_selection_btn.clicked.connect(self.run_scan_selection)
 
         scan_row.addWidget(self.scan_scene_btn)
@@ -107,13 +127,10 @@ class ToolWindow(QtWidgets.QWidget):
 
         root.addWidget(self._make_separator())
 
-        # ── Output path + Organize ────────────────────────────
-        # Text field so the artist can see and edit the destination folder.
-        # The Browse button opens a folder picker as a convenience.
-        # Organize Textures is disabled until a scan has been run.
+        # ── Output path ───────────────────────────────────────
+        # Where textures will be moved on disk when the artist approves.
 
-        path_label = QtWidgets.QLabel("Move textures to:")
-        root.addWidget(path_label)
+        root.addWidget(QtWidgets.QLabel("Move textures to:"))
 
         path_row = QtWidgets.QHBoxLayout()
 
@@ -133,62 +150,136 @@ class ToolWindow(QtWidgets.QWidget):
 
         root.addLayout(path_row)
 
-        self.organize_btn = QtWidgets.QPushButton("Organize Textures")
-        self.organize_btn.setToolTip(
-            "Move classified textures into category subfolders inside the output folder.\n"
-            "Maya's file texture paths will be updated automatically."
-        )
-        self.organize_btn.setEnabled(False)   # enabled in _on_scan_complete()
-        self.organize_btn.clicked.connect(self._on_organize_clicked)
-        root.addWidget(self.organize_btn)
-
         root.addWidget(self._make_separator())
 
+        # ── Batch controls ────────────────────────────────────
+        # One-click operations that set status on multiple rows at once.
+        # Dry Run toggle prevents any scene or disk changes when on.
+
+        batch_row = QtWidgets.QHBoxLayout()
+
+        self.accept_high_btn = QtWidgets.QPushButton("Accept >90%")
+        self.accept_high_btn.setToolTip(
+            f"Set status to Accepted for all items with confidence above {AUTO_ACCEPT_THRESHOLD*100:.0f}%"
+        )
+        self.accept_high_btn.setEnabled(False)
+        self.accept_high_btn.clicked.connect(self._batch_accept_high)
+
+        self.reject_low_btn = QtWidgets.QPushButton("Reject <50%")
+        self.reject_low_btn.setToolTip(
+            "Set status to Rejected for all items with confidence below 50%"
+        )
+        self.reject_low_btn.setEnabled(False)
+        self.reject_low_btn.clicked.connect(self._batch_reject_low)
+
+        self.reset_btn = QtWidgets.QPushButton("Reset All")
+        self.reset_btn.setToolTip("Reset all statuses to Pending and clear all overrides")
+        self.reset_btn.setEnabled(False)
+        self.reset_btn.clicked.connect(self._batch_reset)
+
+        # Dry Run checkbox — sits at the right of the batch row
+        self.dry_run_chk = QtWidgets.QCheckBox("Dry Run")
+        self.dry_run_chk.setToolTip(
+            "When checked, clicking Approve & Organize logs what would happen\n"
+            "to the Script Editor but makes no changes to the scene or disk.\n"
+            "Uncheck to apply for real."
+        )
+
+        batch_row.addWidget(self.accept_high_btn)
+        batch_row.addWidget(self.reject_low_btn)
+        batch_row.addWidget(self.reset_btn)
+        batch_row.addStretch()
+        batch_row.addWidget(self.dry_run_chk)
+        root.addLayout(batch_row)
+
         # ── Filter dropdown ───────────────────────────────────
-        # Lets the artist narrow the table to one material category
 
         filter_row = QtWidgets.QHBoxLayout()
-        filter_label = QtWidgets.QLabel("Show:")
-        filter_row.addWidget(filter_label)
+        filter_row.addWidget(QtWidgets.QLabel("Show:"))
 
         self.filter_combo = QtWidgets.QComboBox()
-        self.filter_combo.addItems(CATEGORIES)
-        self.filter_combo.setToolTip("Filter results by material category")
+        self.filter_combo.addItems(FILTER_OPTIONS)
+        self.filter_combo.setToolTip("Filter the review table by material category")
         self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.filter_combo)
         filter_row.addStretch()
         root.addLayout(filter_row)
 
-        # ── Results table ─────────────────────────────────────
-        # Shows one row per scanned object with its predicted label and confidence
+        # ── Review table ──────────────────────────────────────
+        # Five columns:
+        #   Object     — Maya node name
+        #   Predicted  — ML prediction label
+        #   Confidence — ML confidence score
+        #   Override   — QComboBox to change the label before applying
+        #   Status     — click to cycle between Pending / Accepted / Rejected
+        #
+        # The Override column uses setItemWidget() to embed a QComboBox
+        # directly in each cell. This lets artists pick a different category
+        # without leaving the table.
+        #
+        # The Status column shows a plain text label. Clicking a row calls
+        # _on_status_clicked() which cycles the status and refreshes the row.
 
         self.table = QtWidgets.QTreeWidget()
-        self.table.setHeaderLabels(["Object", "Material", "Confidence"])
-        self.table.setColumnWidth(0, 180)
-        self.table.setColumnWidth(1, 80)
-        self.table.setColumnWidth(2, 80)
-        self.table.setRootIsDecorated(False)      # flat list, no tree arrows
-        self.table.setAlternatingRowColors(True)  # easier to read with alternating colours
-        self.table.setSortingEnabled(True)        # click column headers to sort
-        self.table.setToolTip("Click a row to see texture path and per-class scores")
-        self.table.itemClicked.connect(self._on_row_clicked)
-        root.addWidget(self.table, stretch=1)     # stretch=1 lets the table expand to fill space
+        self.table.setHeaderLabels(
+            ["Object", "Predicted", "Confidence", "Override", "Status"]
+        )
+        self.table.setColumnWidth(0, 130)
+        self.table.setColumnWidth(1, 90)
+        self.table.setColumnWidth(2, 90)
+        self.table.setColumnWidth(3, 100)
+        self.table.setColumnWidth(4, 70)
+        self.table.setRootIsDecorated(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(False)   # disabled — override widgets break sorting
+        self.table.setToolTip(
+            "Click the Status column to cycle: Pending → Accepted → Rejected\n"
+            "Use the Override dropdown to change the predicted label before applying."
+        )
+        self.table.itemClicked.connect(self._on_table_clicked)
+        root.addWidget(self.table, stretch=1)
+
+        # ── Footer counts ─────────────────────────────────────
+        # Live totals showing how many items are in each status.
+        # Updated every time a status changes.
+
+        self.footer_label = QtWidgets.QLabel("—")
+        self.footer_label.setAlignment(QtCore.Qt.AlignLeft)
+        root.addWidget(self.footer_label)
+
+        # ── Approve & Organize button ─────────────────────────
+        # Disabled until a scan has been run.
+        # Only processes items with status == "accepted".
+        # Writes metadata to shader nodes AND moves texture files on disk.
+
+        self.approve_btn = QtWidgets.QPushButton("Approve & Organize")
+        self.approve_btn.setToolTip(
+            "Write material tags to shaders and move textures on disk\n"
+            "for all Accepted items only.\n\n"
+            "Rejected and Pending items are not touched.\n"
+            "Enable Dry Run to preview without making any changes."
+        )
+        self.approve_btn.setEnabled(False)
+        self.approve_btn.clicked.connect(self._on_approve_clicked)
+        root.addWidget(self.approve_btn)
+
+        root.addWidget(self._make_separator())
 
         # ── Detail panel ──────────────────────────────────────
-        # Hidden until the artist clicks a row in the table.
-        # Shows the full texture path and every category's confidence score.
+        # Hidden until the artist clicks a row.
+        # Shows the texture path and per-class confidence scores.
 
         self.detail_group = QtWidgets.QGroupBox("Details")
         detail_layout = QtWidgets.QFormLayout(self.detail_group)
         detail_layout.setContentsMargins(6, 6, 6, 6)
-        detail_layout.setSpacing(8)
+        detail_layout.setSpacing(6)
 
         self.detail_object = QtWidgets.QLabel("—")
         self.detail_shader = QtWidgets.QLabel("—")
 
-        # Word wrap allows long file paths to break across lines
         self.detail_path = QtWidgets.QLabel("—")
         self.detail_path.setWordWrap(True)
+        self.detail_path.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         self.detail_scores = QtWidgets.QLabel("—")
         self.detail_scores.setWordWrap(True)
@@ -202,18 +293,14 @@ class ToolWindow(QtWidgets.QWidget):
         root.addWidget(self.detail_group)
 
         # ── Status bar ────────────────────────────────────────
-        # One line of text at the bottom showing what the tool is doing
 
         root.addWidget(self._make_separator())
-        self.status_label = QtWidgets.QLabel("Ready")
+        self.status_label = QtWidgets.QLabel("Ready — scan a scene or selection to begin")
         self.status_label.setAlignment(QtCore.Qt.AlignLeft)
         root.addWidget(self.status_label)
 
     def _make_separator(self):
-        """
-        Return a thin horizontal line widget used as a visual divider
-        between sections of the UI.
-        """
+        """Return a thin horizontal line used as a visual divider."""
         line = QtWidgets.QFrame()
         line.setFrameShape(QtWidgets.QFrame.HLine)
         line.setFrameShadow(QtWidgets.QFrame.Sunken)
@@ -222,25 +309,24 @@ class ToolWindow(QtWidgets.QWidget):
     # ── Scan actions ──────────────────────────────────────────
 
     def run_scan_scene(self):
-        """
-        Triggered when the artist clicks 'Scan Scene'.
-        Tells the scanner to collect every mesh in the scene, then classifies them.
-        """
+        """Collect every mesh in the scene then run classification."""
         self.tools.get_all_scene_meshes()
         self._run_classify()
 
     def run_scan_selection(self):
-        """
-        Triggered when the artist clicks 'Scan Selection'.
-        Tells the scanner to collect only the selected meshes, then classifies them.
-        """
+        """Collect only the selected meshes then run classification."""
         self.tools.get_selected_meshes()
         self._run_classify()
 
     def _run_classify(self):
         """
-        Run the full classification pipeline on whatever objects the scanner collected.
-        Updates the status bar as each object is processed, then populates the table.
+        Run the ML classification pipeline on self.tools.objects.
+
+        After this call:
+          - self.tools.results holds raw predictions (no scene writes)
+          - self.review_queue holds one entry per object with a status
+            pre-set based on confidence (>=90% → accepted, else pending)
+          - The table is populated and the artist can review before applying
         """
 
         total = len(self.tools.objects)
@@ -249,22 +335,19 @@ class ToolWindow(QtWidgets.QWidget):
             self.status_label.setText("No mesh objects found.")
             return
 
-        # Clear the previous results before the new scan starts
+        # Clear previous state
         self.table.clear()
-        self.all_results = []
+        self.review_queue   = []
         self.detail_group.setVisible(False)
-        self.organize_btn.setEnabled(False)   # disable until the new scan completes
+        self.approve_btn.setEnabled(False)
+        self.accept_high_btn.setEnabled(False)
+        self.reject_low_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
+        self.footer_label.setText("—")
         self.status_label.setText(f"Scanning 0 / {total}...")
-
-        # processEvents() forces the UI to redraw right now so the artist
-        # sees the status update instead of a frozen window during the scan
         QtWidgets.QApplication.processEvents()
 
         def on_progress(current, total, object_name):
-            """
-            Called by scan_and_classify() after each object is processed.
-            Updates the status bar so the artist can see progress in real time.
-            """
             self.status_label.setText(f"Scanning {current} / {total} — {object_name}")
             QtWidgets.QApplication.processEvents()
 
@@ -272,159 +355,256 @@ class ToolWindow(QtWidgets.QWidget):
         results = self.tools.scan_and_classify(progress_callback=on_progress)
         elapsed = time.monotonic() - t0
 
-        # Build a flat list of entry dicts for the table.
-        # We only store static scan-time values here (label, confidence, scores).
-        # The albedo_path is intentionally NOT stored here — it is always read
-        # live from self.tools.results at click time in _on_row_clicked().
-        # This guarantees the detail panel always shows the current path, even
-        # after organize_textures() has moved files and updated the results dict.
+        # Build the review queue from the raw results.
+        # Auto-accept high confidence results so the artist only needs to
+        # review the uncertain ones — this is the "smart default" pattern
+        # used in production pipeline tools.
         for transform, data in results.items():
-            short = transform.split("|")[-1]   # just the node name, not the full path
-            entry = {
-                "transform":  transform,
-                "short":      short,
-                # Static values — won't change after a scan
-                "label":      data.get("label", "unknown"),
-                "confidence": data.get("confidence", 0.0),
-                "all_scores": data.get("all_scores", {}),
-                "shader":     data.get("shader", "—"),
-            }
-            self.all_results.append(entry)
+            confidence = data.get("confidence", 0.0)
+            label      = data.get("label", "unknown")
+
+            # High confidence and valid label → auto-accept
+            # Low confidence or unknown/error → leave as pending for review
+            if confidence >= AUTO_ACCEPT_THRESHOLD and label not in ("unknown", "error"):
+                initial_status = "accepted"
+            else:
+                initial_status = "pending"
+
+            self.review_queue.append({
+                "transform":   transform,
+                "short":       transform.split("|")[-1],
+                "label":       label,
+                "confidence":  confidence,
+                "all_scores":  data.get("all_scores", {}),
+                "override":    None,
+                "status":      initial_status,
+                "albedo_path": data.get("albedo_path"),
+            })
 
         self._on_scan_complete(total, elapsed)
 
     def _on_scan_complete(self, total, elapsed):
         """
-        Called at the end of _run_classify() once all results are ready.
-        Updates the status bar, populates a default output path, enables
-        the Organize button, and fills the table.
+        Called after _run_classify() finishes.
+        Enables controls, sets a default output path, and populates the table.
         """
 
         object_word = "object" if total == 1 else "objects"
         self.status_label.setText(
-            f"Scan complete — {total} {object_word} in {elapsed:.1f}s"
+            f"Scan complete — {total} {object_word} in {elapsed:.1f}s  "
         )
 
-        # Populate a sensible default output path if the field is still empty.
-        # Don't overwrite it if the artist already typed something.
+        # Suggest a default output path only if the field is empty
         if not self.output_path_field.text().strip():
             scene_path = cmds.file(query=True, sceneName=True) or ""
             if scene_path:
                 default_dir = os.path.join(os.path.dirname(scene_path), "textures")
-            else:
-                project_root = cmds.workspace(query=True, rootDirectory=True) or ""
-                default_dir  = os.path.join(project_root, "sourceimages", "textures")
-            self.output_path_field.setText(os.path.normpath(default_dir))
+                self.output_path_field.setText(os.path.normpath(default_dir))
 
-        # Now that we have results, the artist can organize the textures
-        self.organize_btn.setEnabled(True)
+        self.approve_btn.setEnabled(True)
+        self.accept_high_btn.setEnabled(True)
+        self.reject_low_btn.setEnabled(True)
+        self.reset_btn.setEnabled(True)
 
         self._populate_table()
+        self._update_footer()
 
     # ── Table display ─────────────────────────────────────────
 
     def _populate_table(self):
         """
-        Fill the results table from self.all_results, applying the active filter.
-        Called after every scan and every time the filter dropdown changes.
+        Fill the review table from self.review_queue, applying the active filter.
 
-        Each row stores the transform key (not the full entry dict) via UserRole.
-        _on_row_clicked() uses that key to look up live data from self.tools.results,
-        so the detail panel always shows the current albedo_path — even after
-        organize_textures() has moved files and updated the results dict.
+        For each row:
+          - Columns 0-2 (Object, Predicted, Confidence) are plain text
+          - Column 3 (Override) gets a QComboBox embedded via setItemWidget()
+          - Column 4 (Status) is plain text — clicking cycles the status
+
+        The index into self.review_queue is stored on each row via UserRole
+        so _on_table_clicked() and _on_override_changed() can find the entry.
         """
 
+        # Temporarily disconnect itemClicked to prevent it firing while
+        # we rebuild rows (setItemWidget triggers internal signals).
+        self.table.itemClicked.disconnect(self._on_table_clicked)
         self.table.clear()
 
-        # Apply the active category filter.
-        # "all" shows everything; any other value shows only that category.
         if self.active_filter == "all":
-            visible_results = self.all_results
+            visible = self.review_queue
         else:
-            visible_results = [
-                r for r in self.all_results if r["label"] == self.active_filter
-            ]
+            visible = [e for e in self.review_queue if (e.get("override") or e["label"]) == self.active_filter]
 
-        for entry in visible_results:
-            # Format the confidence as a percentage string, or "—" if zero
-            if entry["confidence"] > 0:
-                confidence_str = f"{entry['confidence'] * 100:.1f}%"
-            else:
-                confidence_str = "—"
+        for queue_index, entry in enumerate(self.review_queue):
+            # Apply filter — skip rows that don't match
+            effective_label = entry.get("override") or entry["label"]
+            if self.active_filter != "all" and effective_label != self.active_filter:
+                continue
+
+            confidence_str = (
+                f"{entry['confidence'] * 100:.1f}%"
+                if entry["confidence"] > 0 else "—"
+            )
 
             row = QtWidgets.QTreeWidgetItem([
                 entry["short"],
                 entry["label"],
                 confidence_str,
+                "",            # Override column — widget set below
+                entry["status"].capitalize(),
             ])
 
-            # Store only the transform key on the row — NOT a snapshot of the
-            # entry dict. This is the fix for the stale path bug:
-            # _on_row_clicked() will use this key to look up the current data
-            # from self.tools.results every single time the row is clicked,
-            # so it always reflects the latest albedo_path regardless of whether
-            # organize_textures() has run since the table was last built.
-            row.setData(0, QtCore.Qt.UserRole, entry["transform"])
+            # Store the queue index so event handlers can find this entry
+            row.setData(0, QtCore.Qt.UserRole, queue_index)
 
             self.table.addTopLevelItem(row)
 
-    def _on_filter_changed(self, selected_category):
-        """
-        Triggered when the artist changes the filter dropdown.
-        Rebuilds the table to show only the selected category.
-        """
-        self.active_filter = selected_category
-        self.detail_group.setVisible(False)   # hide detail panel when filter changes
+            # Embed a QComboBox in the Override column.
+            # "— keep —" means use the original ML prediction.
+            # Any other choice replaces the label when applying.
+            override_combo = QtWidgets.QComboBox()
+            override_combo.addItem("— keep —")
+            for cls in CLASSES:
+                override_combo.addItem(cls)
+
+            # Restore the artist's previous override selection if there is one
+            if entry["override"]:
+                idx = override_combo.findText(entry["override"])
+                if idx >= 0:
+                    override_combo.setCurrentIndex(idx)
+
+            # Pass the queue index into the lambda so it survives the loop
+            override_combo.currentTextChanged.connect(
+                lambda text, qi=queue_index: self._on_override_changed(qi, text)
+            )
+
+            self.table.setItemWidget(row, 3, override_combo)
+
+        self.table.itemClicked.connect(self._on_table_clicked)
+
+    def _on_filter_changed(self, selected):
+        """Rebuild the table for the newly selected filter category."""
+        self.active_filter = selected
+        self.detail_group.setVisible(False)
         self._populate_table()
+
+    def _on_table_clicked(self, item, column):
+        """
+        Handles all clicks on the review table.
+
+        Column 4 (Status) — cycle the status for this row
+        Any other column  — show the detail panel for this row
+        """
+
+        queue_index = item.data(0, QtCore.Qt.UserRole)
+        if queue_index is None:
+            return
+
+        if column == 4:
+            # Cycle the status and refresh just this row's status cell
+            entry          = self.review_queue[queue_index]
+            entry["status"] = STATUS_CYCLE[entry["status"]]
+            item.setText(4, entry["status"].capitalize())
+            self._update_footer()
+        else:
+            # Show the detail panel for this object
+            self._show_detail(queue_index)
+
+    def _on_override_changed(self, queue_index, text):
+        """
+        Called when the artist changes the Override dropdown for a row.
+        Stores None (keep original) or the chosen category string.
+        Also refreshes the footer in case the filter changes visibility.
+        """
+        entry             = self.review_queue[queue_index]
+        entry["override"] = None if text == "— keep —" else text
+        self._update_footer()
+
+    # ── Batch controls ────────────────────────────────────────
+
+    def _batch_accept_high(self):
+        """Accept all items with confidence >= 90%."""
+        for entry in self.review_queue:
+            if entry["confidence"] >= AUTO_ACCEPT_THRESHOLD and \
+               entry["label"] not in ("unknown", "error"):
+                entry["status"] = "accepted"
+        self._populate_table()
+        self._update_footer()
+
+    def _batch_reject_low(self):
+        """Reject all items with confidence below 50%."""
+        for entry in self.review_queue:
+            if entry["confidence"] < 0.50:
+                entry["status"] = "rejected"
+        self._populate_table()
+        self._update_footer()
+
+    def _batch_reset(self):
+        """Reset all statuses to pending and clear all overrides."""
+        for entry in self.review_queue:
+            entry["status"]   = "pending"
+            entry["override"] = None
+        self._populate_table()
+        self._update_footer()
+
+    def _update_footer(self):
+        """
+        Update the footer label with live accepted/rejected/pending counts.
+        Also updates the Approve & Organize button text to show how many
+        items will actually be processed.
+        """
+
+        accepted = sum(1 for e in self.review_queue if e["status"] == "accepted")
+        rejected = sum(1 for e in self.review_queue if e["status"] == "rejected")
+        pending  = sum(1 for e in self.review_queue if e["status"] == "pending")
+
+        self.footer_label.setText(
+            f"{accepted} accepted  ·  {rejected} rejected  ·  {pending} pending"
+        )
+
+        dry = self.dry_run_chk.isChecked()
+        label = (
+            f"Dry Run — would apply {accepted} item{'s' if accepted != 1 else ''}"
+            if dry else
+            f"Approve & Organize ({accepted} item{'s' if accepted != 1 else ''})"
+        )
+        self.approve_btn.setText(label)
 
     # ── Detail panel ──────────────────────────────────────────
 
-    def _on_row_clicked(self, item):
+    def _show_detail(self, queue_index):
         """
-        Triggered when the artist clicks a row in the results table.
-        Populates the detail panel with the texture path and per-class scores.
-
-        Why do we look up self.tools.results here instead of reading from the row?
-        Each row only stores the transform key (set in _populate_table).
-        We intentionally do NOT cache the albedo_path in the row because
-        organize_textures() updates self.tools.results with new paths after moving
-        files. By looking up the live dict every time the row is clicked, the
-        detail panel always shows the current path — never a stale one.
+        Populate the detail panel for the given queue entry.
+        Reads albedo_path live from self.tools.results to always show
+        the current path even after files have been moved.
         """
 
-        # Retrieve the transform key stored on this row at table-build time
-        transform = item.data(0, QtCore.Qt.UserRole)
-        if not transform:
-            return
+        entry     = self.review_queue[queue_index]
+        transform = entry["transform"]
 
-        # Look up the LIVE result dict — always current, never stale
+        # Read the live result dict — albedo_path may have been updated
+        # by apply_approved() if this row was already processed.
         live_data = self.tools.results.get(transform, {})
 
-        # Build the scores string — sorted highest to lowest so the
-        # most likely categories appear at the top
-        scores = live_data.get("all_scores", {})
+        scores = entry.get("all_scores", {})
         if scores:
             score_lines = [
-                f"{category}: {value * 100:.1f}%"
-                for category, value in sorted(scores.items(), key=lambda x: -(x[1] or 0))
+                f"{cat}: {val * 100:.1f}%"
+                for cat, val in sorted(scores.items(), key=lambda x: -(x[1] or 0))
             ]
             score_str = "\n".join(score_lines)
         else:
             score_str = "—"
 
-        self.detail_object.setText(transform.split("|")[-1])
+        self.detail_object.setText(entry["short"])
         self.detail_shader.setText(live_data.get("shader") or "—")
         self.detail_path.setText(live_data.get("albedo_path") or "no texture connected")
         self.detail_scores.setText(score_str)
         self.detail_group.setVisible(True)
 
-    # ── Organize Textures ─────────────────────────────────────
+    # ── Browse ────────────────────────────────────────────────
 
     def _on_browse_clicked(self):
-        """
-        Opens a folder picker and writes the chosen path into the output path field.
-        Uses whatever is already in the field as the starting directory.
-        """
+        """Open a folder picker and write the chosen path into the path field."""
         current = self.output_path_field.text().strip()
         start   = current if os.path.isdir(current) else ""
 
@@ -438,39 +618,42 @@ class ToolWindow(QtWidgets.QWidget):
         if chosen:
             self.output_path_field.setText(os.path.normpath(chosen))
 
-    def _on_organize_clicked(self):
+    # ── Approve & Organize ────────────────────────────────────
+
+    def _on_approve_clicked(self):
         """
-        Triggered when the artist clicks 'Organize Textures'.
+        Triggered when the artist clicks 'Approve & Organize'.
 
         Flow:
-          1. Check there are classified textures to move.
-          2. Read the destination path from the path field.
-          3. One confirmation dialog — shows the path, Move Files / Cancel.
-          4. Run organize_textures() and report result in the status bar.
-             Only shows a second dialog if files actually failed to move.
+          1. Count accepted items — bail early if none.
+          2. Validate the destination folder.
+          3. One confirmation dialog.
+          4. Call pbr_tools.apply_approved() which handles both metadata
+             writing and file organization in one pass.
+          5. Report the result in the status bar.
+
+        Dry Run mode skips all scene/disk changes and logs to Script Editor.
         """
 
-        # ── Step 1: check there is something to move ─────────
+        dry_run  = self.dry_run_chk.isChecked()
+        accepted = [e for e in self.review_queue if e["status"] == "accepted"]
 
-        movable_paths = set()
-        for data in self.tools.results.values():
-            path  = data.get("albedo_path")
-            label = data.get("label")
-            if path and label not in (None, "unknown", "error"):
-                movable_paths.add(path)
+        # ── Step 1: check there is something to apply ─────────
 
-        texture_count = len(movable_paths)
-
-        if texture_count == 0:
-            self.status_label.setText("Nothing to organize — run a scan first.")
+        if not accepted:
+            self.status_label.setText(
+                "No accepted items — set at least one row to Accepted first."
+            )
             return
 
-        # ── Step 2: read and validate the destination path ───
+        # ── Step 2: validate the destination folder ───────────
 
         chosen_dir = self.output_path_field.text().strip()
 
         if not chosen_dir:
-            self.status_label.setText("Enter a destination folder before organizing.")
+            self.status_label.setText(
+                "Enter a destination folder before organizing."
+            )
             self.output_path_field.setFocus()
             return
 
@@ -488,85 +671,98 @@ class ToolWindow(QtWidgets.QWidget):
 
         chosen_dir = os.path.normpath(chosen_dir)
 
-        # ── Step 3: one confirmation dialog ──────────────────
+        # ── Step 3: confirmation dialog ───────────────────────
 
-        file_word = "file" if texture_count == 1 else "files"
+        item_word = "item" if len(accepted) == 1 else "items"
+        dry_note  = "\n\nDry Run is ON — no files will be moved or scene modified." if dry_run else ""
 
         confirm = QtWidgets.QMessageBox(self)
-        confirm.setWindowTitle("Organize Textures")
-        confirm.setText(f"Move {texture_count} texture {file_word}?")
+        confirm.setWindowTitle("Approve & Organize")
+        confirm.setText(
+            f"{'[DRY RUN] ' if dry_run else ''}Apply {len(accepted)} approved {item_word}?"
+        )
         confirm.setInformativeText(
-            f"To:  {chosen_dir}\\<category>\\\n\n"
-            f"Maya's texture paths will be updated automatically.\n"
-            f"This cannot be undone."
+            f"For each accepted item this will:\n"
+            f"  1. Write materialType + mlConfidence to the shader node\n"
+            f"  2. Move the texture file into {chosen_dir}\\<category>\\\n"
+            f"  3. Update Maya's file texture paths automatically"
+            f"{dry_note}\n\n"
+            f"Rejected and Pending items will not be touched.\n"
+            f"{'This cannot be undone.' if not dry_run else ''}"
         )
 
-        move_button   = confirm.addButton("Move Files", QtWidgets.QMessageBox.AcceptRole)
-        cancel_button = confirm.addButton("Cancel",     QtWidgets.QMessageBox.RejectRole)
-        confirm.setDefaultButton(cancel_button)   # Cancel is default — safer for destructive actions
+        ok_label  = "Run Dry Run" if dry_run else "Apply"
+        ok_btn    = confirm.addButton(ok_label, QtWidgets.QMessageBox.AcceptRole)
+        cancel_btn = confirm.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        confirm.setDefaultButton(cancel_btn)
         confirm.exec()
 
-        if confirm.clickedButton() == cancel_button:
+        if confirm.clickedButton() == cancel_btn:
             return
 
-        # ── Step 4: run and report in the status bar ─────────
+        # ── Step 4: run apply_approved() ─────────────────────
 
-        self.organize_btn.setEnabled(False)
-        self.status_label.setText("Moving textures...")
+        self.approve_btn.setEnabled(False)
+        self.status_label.setText(
+            f"{'[DRY Run] ' if dry_run else ''}Applying {len(accepted)} {item_word}..."
+        )
         QtWidgets.QApplication.processEvents()
 
-        def on_organize_progress(current, total, filename):
-            """
-            Called by organize_textures() after each file is moved.
-            Keeps the status bar updated so the artist sees progress on large sets.
-            """
-            self.status_label.setText(f"Moving {current} / {total} — {filename}")
+        def on_progress(current, total, name):
+            self.status_label.setText(
+                f"{'[DRY RUN] ' if dry_run else ''}Applying {current} / {total} — {name}"
+            )
             QtWidgets.QApplication.processEvents()
 
-        summary = self.tools.organize_textures(
-            output_dir=chosen_dir,
-            progress_callback=on_organize_progress,
+        summary = self.tools.apply_approved(
+            review_queue      = self.review_queue,
+            output_dir        = chosen_dir,
+            dry_run           = dry_run,
+            progress_callback = on_progress,
         )
 
-        moved   = summary.get("moved",   0)
-        skipped = summary.get("skipped", 0)
-        failed  = summary.get("failed",  0)
+        tagged  = summary.get("metadata_written", 0)
+        moved   = summary.get("files_moved",      0)
+        skipped = summary.get("skipped",          0)
+        failed  = summary.get("failed",           0)
 
-        # Refresh the detail panel if it's currently open.
-        # Because _on_row_clicked() always reads live from self.tools.results,
-        # we just need to re-call the display logic for the currently shown object.
-        # We identify it by the short name shown in the detail_object label.
+        # ── Step 5: report result in status bar ───────────────
+
+        prefix = "[DRY RUN] " if dry_run else ""
+        parts  = []
+        if tagged:
+            parts.append(f"{tagged} tagged")
+        if moved:
+            parts.append(f"{moved} moved")
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        if failed:
+            parts.append(f"{failed} failed")
+
+        self.status_label.setText(
+            f"{prefix}Done — " + (", ".join(parts) if parts else "nothing applied")
+        )
+
+        # Refresh the detail panel path if it's open — the texture may
+        # have moved, and self.tools.results was updated by apply_approved().
         if self.detail_group.isVisible():
-            shown_short = self.detail_object.text()
-            for entry in self.all_results:
-                if entry["short"] == shown_short:
-                    # Look up the live result dict — albedo_path is already updated
-                    # by organize_textures() inside self.tools.results
+            shown = self.detail_object.text()
+            for entry in self.review_queue:
+                if entry["short"] == shown:
                     live_data = self.tools.results.get(entry["transform"], {})
                     self.detail_path.setText(
                         live_data.get("albedo_path") or "no texture connected"
                     )
                     break
 
-        # Report in the status bar — no popup needed on success
-        parts = []
-        if moved:
-            parts.append(f"{moved} moved")
-        if skipped:
-            parts.append(f"{skipped} already organized")
-        if failed:
-            parts.append(f"{failed} failed")
-        self.status_label.setText(
-            "Done — " + (", ".join(parts) if parts else "nothing to move")
-        )
+        self.approve_btn.setEnabled(True)
+        self._update_footer()
 
-        self.organize_btn.setEnabled(True)
-
-        # Only interrupt the artist with a dialog if something actually went wrong
+        # Only interrupt the artist with a dialog if something went wrong
         if failed > 0:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Some files could not be moved",
+                "Some items failed",
                 f"{failed} file{'s' if failed != 1 else ''} could not be moved.\n"
                 f"Check the Script Editor for details."
             )
