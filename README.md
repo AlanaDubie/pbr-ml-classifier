@@ -22,6 +22,15 @@ The system integrates directly into Maya scenes to tag shader nodes with materia
   - full class probability breakdown
 - Lightweight inference using a ResNet-18 model trained on curated PBR datasets
 
+### Review & Approval Workflow
+- Results are stored in an interactive review table inside Maya
+- Artists can:
+  - Accept / reject per object
+  - Override predicted labels before applying
+  - Batch accept/reject based on confidence thresholds
+- Auto-accepts high-confidence predictions (≥90%)
+- Includes optional **Dry Run mode** to preview all actions safely
+
 ### Scene Integration
 - Tags shaders with:
   - `materialType` (string attribute)

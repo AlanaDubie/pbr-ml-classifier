@@ -17,6 +17,7 @@
 #   Items >= 90% confidence auto-accepted, rest stay pending
 #   Artist reviews table, clicks Status to cycle, uses Override in detail panel
 #   Override shown as "rock *" in Material column — asterisk = manually corrected
+#   Confidence column shows "manual" when override is set
 #   Hover tooltip on overridden row shows the original prediction
 #   Click Organize Textures → only accepted rows get metadata + files moved
 # ─────────────────────────────────────────────────────────────
@@ -78,10 +79,12 @@ class ToolWindow(QtWidgets.QWidget):
 
         # Flat list of result dicts built after each scan, used to populate the table.
         # Each entry stores the transform key and static scan-time values.
-        # The albedo_path is always read live from self.tools.results at click time.
+        # The albedo_path is stored here AND read live from self.tools.results
+        # at click time — live read keeps the detail panel current after files move.
         # Each entry also stores:
-        #   override — None, or a string if the artist changed the label
-        #   status   — "pending" | "accepted" | "rejected"
+        #   override    — None, or a string if the artist changed the label
+        #   status      — "pending" | "accepted" | "rejected"
+        #   albedo_path — needed by apply_approved() to know which file to move
         self.all_results = []
 
         # Index of the entry currently shown in the detail panel.
@@ -232,8 +235,9 @@ class ToolWindow(QtWidgets.QWidget):
         # Four columns: Object | Material | Confidence | Status
         #
         # Material column shows the predicted label normally.
-        # When an override is set, shows "rock *" — the asterisk signals
-        # a manual correction. Hovering shows the original prediction.
+        # When an override is set, shows "rock *" — asterisk = manually corrected.
+        # Hovering the Material cell shows the original prediction.
+        # Confidence column shows "manual" when an override is set.
         #
         # Status column cycles Pending → Accepted → Rejected on click.
         # All other columns open the detail panel on click.
@@ -251,7 +255,8 @@ class ToolWindow(QtWidgets.QWidget):
             "Click the Status column to cycle: Pending → Accepted → Rejected\n"
             "Click any other column to open the detail panel.\n"
             "Use Override in the detail panel to correct a wrong prediction.\n"
-            "An asterisk (*) in the Material column means manually overridden."
+            "An asterisk (*) in Material means manually overridden.\n"
+            "'manual' in Confidence means human-corrected, not ML-predicted."
         )
         self.table.itemClicked.connect(self._on_table_clicked)
         root.addWidget(self.table, stretch=1)
@@ -267,7 +272,7 @@ class ToolWindow(QtWidgets.QWidget):
         # Hidden until the artist clicks a row.
         # Override dropdown lives here — not in the table — so the table
         # stays clean. When changed, the Material column updates to "rock *"
-        # so corrections are visible at a glance without opening the panel.
+        # and Confidence updates to "manual".
 
         self.detail_group = QtWidgets.QGroupBox("Details")
         detail_layout = QtWidgets.QFormLayout(self.detail_group)
@@ -288,15 +293,16 @@ class ToolWindow(QtWidgets.QWidget):
 
         # Override dropdown — pick a different label if the ML prediction is wrong.
         # "— keep —" means use the original prediction.
-        # Changing this shows "label *" in the Material column immediately.
+        # Changing this shows "label *" in Material and "manual" in Confidence.
         self.override_combo = QtWidgets.QComboBox()
         self.override_combo.addItem("— keep —")
         for cls in CLASSES:
             self.override_combo.addItem(cls)
         self.override_combo.setToolTip(
             "Change the predicted label for this object.\n"
-            "The Material column will show the corrected label with an asterisk (*).\n"
-            "Hovering the row shows the original prediction.\n"
+            "Material column will show the corrected label with an asterisk (*).\n"
+            "Confidence column will show 'manual'.\n"
+            "Hover the Material cell to see the original prediction.\n"
             "The corrected label is used when organizing textures."
         )
 
@@ -368,8 +374,10 @@ class ToolWindow(QtWidgets.QWidget):
         elapsed = time.monotonic() - t0
 
         # Build a flat list of entry dicts for the table.
-        # Static scan-time values only — albedo_path is always read live
-        # from self.tools.results at click time so it stays current after files move.
+        # albedo_path is stored here so apply_approved() can find which
+        # file to move for each accepted entry. It is also read live from
+        # self.tools.results at detail-panel click time so the displayed
+        # path stays current after organize has moved files.
         for transform, data in results.items():
             short      = transform.split("|")[-1]
             confidence = data.get("confidence", 0.0)
@@ -383,14 +391,15 @@ class ToolWindow(QtWidgets.QWidget):
                 initial_status = "pending"
 
             self.all_results.append({
-                "transform":  transform,
-                "short":      short,
-                "label":      label,
-                "confidence": confidence,
-                "all_scores": data.get("all_scores", {}),
-                "shader":     data.get("shader", "—"),
-                "override":   None,
-                "status":     initial_status,
+                "transform":   transform,
+                "short":       short,
+                "label":       label,
+                "confidence":  confidence,
+                "all_scores":  data.get("all_scores", {}),
+                "shader":      data.get("shader", "—"),
+                "override":    None,
+                "status":      initial_status,
+                "albedo_path": data.get("albedo_path"),   # required by apply_approved()
             })
 
         self._on_scan_complete(total, elapsed)
@@ -427,8 +436,12 @@ class ToolWindow(QtWidgets.QWidget):
 
         Material column:
           - Normal prediction: "wood"
-          - After override set: "rock *"
-            Asterisk = manually corrected. Tooltip shows original prediction.
+          - After override:    "rock *"  (asterisk = manually corrected)
+            Tooltip on the cell shows the original prediction.
+
+        Confidence column:
+          - Normal:          "99.4%"
+          - After override:  "manual"  (human-corrected, not ML-predicted)
 
         Status column shows current status. Clicking it cycles the status.
         Each row stores its index into self.all_results via UserRole.
@@ -440,8 +453,7 @@ class ToolWindow(QtWidgets.QWidget):
             if self.active_filter != "all" and effective_label != self.active_filter:
                 continue
 
-            # Show "manual" in the confidence column when an override is set
-            # so the artist can see at a glance this row was human-corrected
+            # Confidence cell — "manual" when overridden, percentage otherwise
             if entry["override"]:
                 confidence_str = "manual"
             else:
@@ -450,8 +462,7 @@ class ToolWindow(QtWidgets.QWidget):
                     if entry["confidence"] > 0 else "—"
                 )
 
-            # Asterisk signals a manual correction — clean and unambiguous
-            # without competing visually with the confidence score next to it
+            # Material cell — asterisk signals manual correction
             if entry["override"]:
                 material_str = f"{entry['override']} *"
             else:
@@ -466,7 +477,7 @@ class ToolWindow(QtWidgets.QWidget):
 
             row.setData(0, QtCore.Qt.UserRole, i)
 
-            # Tooltip on overridden rows tells artist what the original was
+            # Tooltip on overridden Material cell shows what the original was
             if entry["override"]:
                 row.setToolTip(COL_MATERIAL,
                     f"Manually overridden — original prediction: {entry['label']}")
@@ -475,23 +486,25 @@ class ToolWindow(QtWidgets.QWidget):
 
     def _refresh_row(self, result_index):
         """
-        Refresh Material and Status cells for one row without rebuilding
-        the entire table. Called after a status change or override change.
+        Refresh Material, Confidence, and Status cells for one row without
+        rebuilding the entire table. Called after a status or override change.
         """
         entry = self.all_results[result_index]
 
         for i in range(self.table.topLevelItemCount()):
             item = self.table.topLevelItem(i)
             if item.data(0, QtCore.Qt.UserRole) == result_index:
+
+                # Material cell
                 if entry["override"]:
-                    # Asterisk = manually corrected, tooltip shows original
                     item.setText(COL_MATERIAL, f"{entry['override']} *")
                     item.setToolTip(COL_MATERIAL,
                         f"Manually overridden — original prediction: {entry['label']}")
                 else:
                     item.setText(COL_MATERIAL, entry["label"])
                     item.setToolTip(COL_MATERIAL, "")
-                # Update confidence cell — "manual" when overridden, percentage otherwise
+
+                # Confidence cell
                 if entry["override"]:
                     item.setText(COL_CONFIDENCE, "manual")
                 else:
@@ -499,6 +512,7 @@ class ToolWindow(QtWidgets.QWidget):
                         f"{entry['confidence'] * 100:.1f}%"
                         if entry["confidence"] > 0 else "—"
                     )
+
                 item.setText(COL_STATUS, entry["status"].capitalize())
                 return
 
@@ -627,8 +641,8 @@ class ToolWindow(QtWidgets.QWidget):
         Called when the artist changes the Override dropdown.
 
         Stores the chosen label and immediately updates the Material column
-        to show "label *" so the correction is visible in the table without
-        needing to keep the detail panel open.
+        to show "label *" and Confidence to show "manual" so corrections
+        are visible in the table without keeping the detail panel open.
         """
         if self._detail_index is None:
             return
