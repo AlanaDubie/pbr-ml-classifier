@@ -33,6 +33,73 @@ from texture_name_parser import resolve_asset_name
 CLASSES = ["fabric", "ground", "metal", "rock", "wood"]
 
 
+# Maya-generated folders that should be ignored when deciding whether a
+# directory is "empty enough" to remove. These are not texture files.
+_MAYA_JUNK_DIRS = frozenset({".mayaSwatches"})
+
+
+def _folder_is_empty(folder: str) -> bool:
+    """
+    Return True if a folder contains nothing other than known Maya
+    junk directories (.mayaSwatches etc.) that this tool can ignore.
+
+    A folder with only .mayaSwatches/ in it is functionally empty from
+    the perspective of this tool — there are no texture files there.
+    """
+    try:
+        entries = os.listdir(folder)
+        real_entries = [e for e in entries if e not in _MAYA_JUNK_DIRS]
+        return len(real_entries) == 0
+    except Exception:
+        return False
+
+
+def _remove_if_empty(folder: str) -> None:
+    """
+    Remove a folder if it contains nothing except known Maya junk
+    directories (.mayaSwatches etc.).
+
+    If a .mayaSwatches subfolder is present, it is removed first so
+    the parent folder can then be removed cleanly with os.rmdir().
+
+    Called after moving a texture set to clean up leftover artifact
+    folders at two levels:
+      1. The asset subfolder   e.g. /textures2/rock/cliff_rock_a_v1/
+      2. The category folder   e.g. /textures2/rock/
+
+    Safety contract:
+      - Only acts if _folder_is_empty() confirms nothing real is left
+      - Only removes .mayaSwatches and the folder itself — nothing else
+      - Uses os.rmdir() which cannot remove a non-empty folder
+      - Never walks further up the tree — caller decides how many levels
+      - Silently ignores errors — a leftover folder is never worth
+        interrupting the artist's workflow over
+    """
+    try:
+        if not folder or not os.path.isdir(folder):
+            return
+        if not _folder_is_empty(folder):
+            return
+
+        # Remove any .mayaSwatches subdirectory first so os.rmdir()
+        # can succeed on the parent. We only touch the exact known
+        # junk directories — nothing else is ever deleted here.
+        for junk in _MAYA_JUNK_DIRS:
+            junk_path = os.path.join(folder, junk)
+            if os.path.isdir(junk_path):
+                # Only remove if the swatch folder itself is empty
+                if not os.listdir(junk_path):
+                    os.rmdir(junk_path)
+
+        # Now remove the folder if it's truly empty
+        if not os.listdir(folder):
+            os.rmdir(folder)
+            print(f"[pbr_tools] Removed empty folder: {folder}")
+
+    except Exception as err:
+        print(f"[pbr_tools] Could not remove empty folder {folder}: {err}")
+
+
 class PBRTools:
     def __init__(self):
         self.objects = []   # list of transform node paths to scan
@@ -144,9 +211,16 @@ class PBRTools:
                 # ── Collect ALL file nodes on this shader ─────
                 for fn in cmds.listConnections(shader, type="file") or []:
                     p = cmds.getAttr(f"{fn}.fileTextureName")
-                    if p and os.path.exists(p) and fn not in file_nodes:
-                        all_paths.append(p)
-                        file_nodes.append(fn)
+                    if not p or not os.path.exists(p) or fn in file_nodes:
+                        continue
+                    # Skip Maya's auto-generated swatch cache files.
+                    # Maya creates .mayaSwatches/ next to textures for the
+                    # Hypershade preview thumbnails. They are not texture
+                    # files and must never be moved with the texture set.
+                    if ".mayaSwatches" in p.replace("\\", "/"):
+                        continue
+                    all_paths.append(p)
+                    file_nodes.append(fn)
 
         if not all_paths:
             return None
@@ -486,14 +560,12 @@ class PBRTools:
 
             if not dry_run and all_paths:
                 src_folder = os.path.dirname(os.path.normpath(all_paths[0]))
-                try:
-                    if os.path.isdir(src_folder) and not os.listdir(src_folder):
-                        os.rmdir(src_folder)
-                        print(f"[pbr_tools] Removed empty folder: {src_folder}")
-                except Exception as err:
-                    # Non-fatal — a leftover empty folder is annoying
-                    # but not worth interrupting the artist over.
-                    print(f"[pbr_tools] Could not remove empty folder {src_folder}: {err}")
+                # Clean the asset subfolder (e.g. cliff_rock_a_v1/) then
+                # the category folder one level up (e.g. rock/).
+                # If the artist moved textures to the wrong place first,
+                # re-organizing leaves both levels empty — this removes both.
+                _remove_if_empty(src_folder)
+                _remove_if_empty(os.path.dirname(src_folder))
 
         # ── Update Maya file nodes ────────────────────────────
 
