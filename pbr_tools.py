@@ -53,52 +53,63 @@ def _folder_is_empty(folder: str) -> bool:
     except Exception:
         return False
 
-
-def _remove_if_empty(folder: str) -> None:
+def _remove_if_empty(folder):
     """
-    Remove a folder if it contains nothing except known Maya junk
-    directories (.mayaSwatches etc.).
-
-    If a .mayaSwatches subfolder is present, it is removed first so
-    the parent folder can then be removed cleanly with os.rmdir().
-
-    Called after moving a texture set to clean up leftover artifact
-    folders at two levels:
-      1. The asset subfolder   e.g. /textures2/rock/cliff_rock_a_v1/
-      2. The category folder   e.g. /textures2/rock/
-
-    Safety contract:
-      - Only acts if _folder_is_empty() confirms nothing real is left
-      - Only removes .mayaSwatches and the folder itself — nothing else
-      - Uses os.rmdir() which cannot remove a non-empty folder
-      - Never walks further up the tree — caller decides how many levels
-      - Silently ignores errors — a leftover folder is never worth
-        interrupting the artist's workflow over
+    Remove a folder if it only contains Maya swatch cache data.
     """
+
     try:
         if not folder or not os.path.isdir(folder):
             return
-        if not _folder_is_empty(folder):
+
+        entries = os.listdir(folder)
+
+        # Ignore Maya-generated cache folders
+        real_entries = []
+
+        for e in entries:
+            if e not in _MAYA_JUNK_DIRS:
+                real_entries.append(e)
+
+        # Stop if real files/folders still exist
+        if real_entries:
             return
 
-        # Remove any .mayaSwatches subdirectory first so os.rmdir()
-        # can succeed on the parent. We only touch the exact known
-        # junk directories — nothing else is ever deleted here.
+        # Remove Maya swatch cache folders
         for junk in _MAYA_JUNK_DIRS:
-            junk_path = os.path.join(folder, junk)
-            if os.path.isdir(junk_path):
-                # Only remove if the swatch folder itself is empty
-                if not os.listdir(junk_path):
-                    os.rmdir(junk_path)
 
-        # Now remove the folder if it's truly empty
+            junk_path = os.path.join(folder, junk)
+
+            if os.path.isdir(junk_path):
+
+                # Walk bottom-up so files get removed before folders
+                for root, dirs, files in os.walk(junk_path, topdown=False):
+
+                    for f in files:
+                        try:
+                            os.remove(os.path.join(root, f))
+                        except Exception:
+                            pass
+
+                    for d in dirs:
+                        try:
+                            os.rmdir(os.path.join(root, d))
+                        except Exception:
+                            pass
+
+                # Remove the .mayaSwatches folder itself
+                try:
+                    os.rmdir(junk_path)
+                except Exception:
+                    pass
+
+        # Remove the parent folder if empty now
         if not os.listdir(folder):
             os.rmdir(folder)
             print(f"[pbr_tools] Removed empty folder: {folder}")
 
     except Exception as err:
-        print(f"[pbr_tools] Could not remove empty folder {folder}: {err}")
-
+        print(f"[pbr_tools] Could not remove folder {folder}: {err}")
 
 class PBRTools:
     def __init__(self):
