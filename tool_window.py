@@ -4,21 +4,22 @@
 #
 # Layout (top to bottom):
 #   1. Scan buttons      — Scan Scene / Scan Selection
-#   2. Organize button   — Organize Textures (disabled until scan runs)
-#   3. Batch controls    — Accept >90%, Reject <50%, Reset All, Dry Run toggle
-#   4. Filter dropdown   — filter results by material category
-#   5. Results table     — Object | Material | Confidence | Status
-#   6. Footer counts     — live accepted / rejected / pending totals
-#   7. Detail panel      — texture path, scores, override dropdown
-#   8. Status bar        — current operation or last result count
+#   2. Output path       — destination folder + Browse button
+#   3. Organize button   — Organize Textures (disabled until scan runs)
+#   4. Batch controls    — Accept >90%, Reject <50%, Reset All, Dry Run toggle
+#   5. Filter dropdown   — filter results by material category
+#   6. Results table     — Object | Material | Confidence | Status
+#   7. Footer counts     — live accepted / rejected / pending totals
+#   8. Detail panel      — asset, source folder, shader, maps, scores, override
+#   9. Status bar        — current operation or last result count
 #
 # Review flow:
 #   Scan → predictions stored (no scene writes yet)
 #   Items >= 90% confidence auto-accepted, rest stay pending
 #   Artist reviews table, clicks Status to cycle, uses Override in detail panel
 #   Override shown as "rock *" in Material column — asterisk = manually corrected
-#   Confidence column shows "manual" when override is set
-#   Hover tooltip on overridden row shows the original prediction
+#   Confidence column shows High / Medium / Low / manual quality tiers
+#   Hover confidence cell to see raw percentage
 #   Click Organize Textures → only accepted rows get metadata + files moved
 # ─────────────────────────────────────────────────────────────
 
@@ -32,7 +33,13 @@ import maya.cmds as cmds
 
 from pbr_tools import PBRTools, CLASSES
 
-# The full list of filter options shown in the dropdown.
+try:
+    from texture_name_parser import resolve_asset_name
+except ImportError:
+    def resolve_asset_name(path):
+        return os.path.splitext(os.path.basename(path))[0] if path else "—"
+
+# Filter options shown in the dropdown above the table
 CATEGORIES = ["all", "wood", "rock", "metal", "ground", "fabric"]
 
 # Items at or above this confidence auto-accept after scanning.
@@ -48,12 +55,26 @@ COL_MATERIAL   = 1
 COL_CONFIDENCE = 2
 COL_STATUS     = 3
 
+# Confidence tier thresholds
+CONF_HIGH   = 0.80
+CONF_MEDIUM = 0.50
+
+
+def confidence_tier(value):
+    """Return a quality tier label for a confidence value (0.0–1.0)."""
+    if value >= CONF_HIGH:
+        return "High"
+    elif value >= CONF_MEDIUM:
+        return "Medium"
+    elif value > 0:
+        return "Low"
+    return "—"
+
 
 def get_maya_main_window():
     """
     Return Maya's main application window as a Qt widget.
 
-    Why do we need this?
     Maya runs its own Qt application internally. If we create our tool
     window without parenting it to Maya's window, it behaves like a
     completely separate application — it won't stay on top, it won't
@@ -74,17 +95,21 @@ class ToolWindow(QtWidgets.QWidget):
             parent = get_maya_main_window()
         super().__init__(parent)
 
-        # The tools object handles all Maya logic — the UI just calls its methods
+        # Handles all Maya-side logic — the UI just calls its methods
         self.tools = PBRTools()
 
-        # Flat list of result dicts built after each scan, used to populate the table.
-        # Each entry stores the transform key and static scan-time values.
-        # The albedo_path is stored here AND read live from self.tools.results
-        # at click time — live read keeps the detail panel current after files move.
-        # Each entry also stores:
-        #   override    — None, or a string if the artist changed the label
+        # Flat list of result dicts built after each scan.
+        # Each entry stores:
+        #   transform   — full Maya node path (unique key)
+        #   short       — node name only (shown in table)
+        #   label       — original ML prediction
+        #   confidence  — ML confidence score (0.0 – 1.0)
+        #   all_scores  — full per-class breakdown
+        #   shader      — shader node name (read at scan time)
+        #   override    — None, or a string if artist changed the label
         #   status      — "pending" | "accepted" | "rejected"
-        #   albedo_path — needed by apply_approved() to know which file to move
+        #   albedo_path — primary texture path (also in self.tools.results live)
+        #   all_paths   — full texture set for maps detected display
         self.all_results = []
 
         # Index of the entry currently shown in the detail panel.
@@ -103,10 +128,7 @@ class ToolWindow(QtWidgets.QWidget):
         self.setMinimumHeight(800)
         self.resize(600, 800)
 
-        # Qt.Window makes this a proper floating window instead of an embedded widget
         self.setWindowFlags(QtCore.Qt.Window)
-
-        # WA_DeleteOnClose frees memory when the window is closed
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
 
         self._build_ui()
@@ -117,7 +139,7 @@ class ToolWindow(QtWidgets.QWidget):
     def _build_ui(self):
         """
         Build and arrange all widgets in the window.
-        Called once during __init__ — widgets are never rebuilt after that.
+        Called once during __init__ — never rebuilt after that.
         """
 
         root = QtWidgets.QVBoxLayout(self)
@@ -125,6 +147,7 @@ class ToolWindow(QtWidgets.QWidget):
         root.setSpacing(4)
 
         # ── Scan buttons ──────────────────────────────────────
+
         scan_row = QtWidgets.QHBoxLayout()
 
         self.scan_scene_btn = QtWidgets.QPushButton("Scan Scene")
@@ -148,8 +171,8 @@ class ToolWindow(QtWidgets.QWidget):
         root.addWidget(self._make_separator())
 
         # ── Output path + Organize ────────────────────────────
-        path_label = QtWidgets.QLabel("Move textures to:")
-        root.addWidget(path_label)
+
+        root.addWidget(QtWidgets.QLabel("Move textures to:"))
 
         path_row = QtWidgets.QHBoxLayout()
 
@@ -183,6 +206,9 @@ class ToolWindow(QtWidgets.QWidget):
         root.addWidget(self._make_separator())
 
         # ── Batch controls ────────────────────────────────────
+        # One-click operations that update statuses across multiple rows.
+        # Dry Run toggle prevents any scene or disk changes when checked.
+
         batch_row = QtWidgets.QHBoxLayout()
 
         self.accept_high_btn = QtWidgets.QPushButton("Accept >90%")
@@ -219,9 +245,9 @@ class ToolWindow(QtWidgets.QWidget):
         root.addLayout(batch_row)
 
         # ── Filter dropdown ───────────────────────────────────
+
         filter_row = QtWidgets.QHBoxLayout()
-        filter_label = QtWidgets.QLabel("Show:")
-        filter_row.addWidget(filter_label)
+        filter_row.addWidget(QtWidgets.QLabel("Show:"))
 
         self.filter_combo = QtWidgets.QComboBox()
         self.filter_combo.addItems(CATEGORIES)
@@ -234,34 +260,37 @@ class ToolWindow(QtWidgets.QWidget):
         # ── Results table ─────────────────────────────────────
         # Four columns: Object | Material | Confidence | Status
         #
-        # Material column shows the predicted label normally.
-        # When an override is set, shows "rock *" — asterisk = manually corrected.
-        # Hovering the Material cell shows the original prediction.
-        # Confidence column shows "manual" when an override is set.
-        #
-        # Status column cycles Pending → Accepted → Rejected on click.
+        # Material  — shows "rock *" when an override is set
+        # Confidence — High / Medium / Low tier; hover for raw %
+        # Status    — click to cycle Pending → Accepted → Rejected
         # All other columns open the detail panel on click.
 
         self.table = QtWidgets.QTreeWidget()
         self.table.setHeaderLabels(["Object", "Material", "Confidence", "Status"])
-        self.table.setColumnWidth(COL_OBJECT,     150)
-        self.table.setColumnWidth(COL_MATERIAL,   180)
-        self.table.setColumnWidth(COL_CONFIDENCE, 100)
-        self.table.setColumnWidth(COL_STATUS,      75)
+        self.table.setColumnWidth(COL_OBJECT,      150)
+        self.table.setColumnWidth(COL_MATERIAL,    150)
+        self.table.setColumnWidth(COL_CONFIDENCE,   90)
+        self.table.setColumnWidth(COL_STATUS,       80)
         self.table.setRootIsDecorated(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.setToolTip(
-            "Click the Status column to cycle: Pending → Accepted → Rejected\n"
+            "Click Status to cycle: Pending → Accepted → Rejected\n"
             "Click any other column to open the detail panel.\n"
             "Use Override in the detail panel to correct a wrong prediction.\n"
             "An asterisk (*) in Material means manually overridden.\n"
-            "'manual' in Confidence means human-corrected, not ML-predicted."
+            "Hover Confidence to see the raw score."
+        )
+        self.table.headerItem().setToolTip(
+            COL_CONFIDENCE,
+            "High = 80%+   Medium = 50-80%   Low = below 50%\n"
+            "Hover any row to see the exact confidence score."
         )
         self.table.itemClicked.connect(self._on_table_clicked)
         root.addWidget(self.table, stretch=1)
 
         # ── Footer counts ─────────────────────────────────────
+
         self.footer_label = QtWidgets.QLabel("—")
         self.footer_label.setAlignment(QtCore.Qt.AlignLeft)
         root.addWidget(self.footer_label)
@@ -271,29 +300,33 @@ class ToolWindow(QtWidgets.QWidget):
         # ── Detail panel ──────────────────────────────────────
         # Hidden until the artist clicks a row.
         # Override dropdown lives here — not in the table — so the table
-        # stays clean. When changed, the Material column updates to "rock *"
-        # and Confidence updates to "manual".
+        # stays clean and sortable. When changed, Material column updates
+        # to "rock *" so the correction is visible at a glance.
 
         self.detail_group = QtWidgets.QGroupBox("Details")
         detail_layout = QtWidgets.QFormLayout(self.detail_group)
-        detail_layout.setContentsMargins(6, 6, 6, 6)
-        detail_layout.setSpacing(8)
+        detail_layout.setContentsMargins(6, 8, 6, 8)
+        detail_layout.setSpacing(6)
 
-        self.detail_object = QtWidgets.QLabel("—")
+        self.detail_asset  = QtWidgets.QLabel("—")
+
+        self.detail_source = QtWidgets.QLabel("—")
+        self.detail_source.setWordWrap(True)
+
         self.detail_shader = QtWidgets.QLabel("—")
 
-        self.detail_path = QtWidgets.QLabel("—")
-        self.detail_path.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
-        )
-        self.detail_path.setWordWrap(True)
+        # Maps detected — one filename per line, no checkmarks
+        self.detail_maps = QtWidgets.QLabel("—")
+        self.detail_maps.setWordWrap(True)
+        self.detail_maps.setTextFormat(QtCore.Qt.PlainText)
+
+        # Classification — predicted label + confidence, or "manual (manual)" if overridden
+        self.detail_classification = QtWidgets.QLabel("—")
 
         self.detail_scores = QtWidgets.QLabel("—")
         self.detail_scores.setWordWrap(True)
 
-        # Override dropdown — pick a different label if the ML prediction is wrong.
-        # "— keep —" means use the original prediction.
-        # Changing this shows "label *" in Material and "manual" in Confidence.
+        # Override dropdown — only place to change the predicted label
         self.override_combo = QtWidgets.QComboBox()
         self.override_combo.addItem("— keep —")
         for cls in CLASSES:
@@ -306,16 +339,19 @@ class ToolWindow(QtWidgets.QWidget):
             "The corrected label is used when organizing textures."
         )
 
-        detail_layout.addRow("Object:",   self.detail_object)
-        detail_layout.addRow("Shader:",   self.detail_shader)
-        detail_layout.addRow("Texture:",  self.detail_path)
-        detail_layout.addRow("Scores:",   self.detail_scores)
-        detail_layout.addRow("Override:", self.override_combo)
+        detail_layout.addRow("Asset:",          self.detail_asset)
+        detail_layout.addRow("Source folder:",  self.detail_source)
+        detail_layout.addRow("Shader:",         self.detail_shader)
+        detail_layout.addRow("Maps detected:",  self.detail_maps)
+        detail_layout.addRow("Classification:", self.detail_classification)
+        detail_layout.addRow("Scores:",         self.detail_scores)
+        detail_layout.addRow("Override:",       self.override_combo)
 
         self.detail_group.setVisible(False)
         root.addWidget(self.detail_group)
 
         # ── Status bar ────────────────────────────────────────
+
         root.addWidget(self._make_separator())
         self.status_label = QtWidgets.QLabel("Ready")
         self.status_label.setAlignment(QtCore.Qt.AlignLeft)
@@ -353,8 +389,8 @@ class ToolWindow(QtWidgets.QWidget):
             return
 
         self.table.clear()
-        self.all_results    = []
-        self._detail_index  = None
+        self.all_results         = []
+        self._detail_index       = None
         self.detail_group.setVisible(False)
         self.organize_btn.setEnabled(False)
         self.accept_high_btn.setEnabled(False)
@@ -365,7 +401,6 @@ class ToolWindow(QtWidgets.QWidget):
         QtWidgets.QApplication.processEvents()
 
         def on_progress(current, total, object_name):
-            """Called by scan_and_classify() after each object is processed."""
             self.status_label.setText(f"Scanning {current} / {total} — {object_name}")
             QtWidgets.QApplication.processEvents()
 
@@ -373,18 +408,12 @@ class ToolWindow(QtWidgets.QWidget):
         results = self.tools.scan_and_classify(progress_callback=on_progress)
         elapsed = time.monotonic() - t0
 
-        # Build a flat list of entry dicts for the table.
-        # albedo_path is stored here so apply_approved() can find which
-        # file to move for each accepted entry. It is also read live from
-        # self.tools.results at detail-panel click time so the displayed
-        # path stays current after organize has moved files.
         for transform, data in results.items():
             short      = transform.split("|")[-1]
             confidence = data.get("confidence", 0.0)
             label      = data.get("label", "unknown")
 
-            # High confidence + valid label → auto-accept so artist only
-            # needs to review uncertain items rather than approving everything
+            # High confidence + valid label → auto-accept
             if confidence >= AUTO_ACCEPT_THRESHOLD and label not in ("unknown", "error"):
                 initial_status = "accepted"
             else:
@@ -396,10 +425,11 @@ class ToolWindow(QtWidgets.QWidget):
                 "label":       label,
                 "confidence":  confidence,
                 "all_scores":  data.get("all_scores", {}),
-                "shader":      data.get("shader", "—"),
+                "shader":      data.get("shader"),      # read at scan time by get_shader_name()
                 "override":    None,
                 "status":      initial_status,
-                "albedo_path": data.get("albedo_path"),   # required by apply_approved()
+                "albedo_path": data.get("albedo_path"),
+                "all_paths":   data.get("all_paths", []),
             })
 
         self._on_scan_complete(total, elapsed)
@@ -435,16 +465,16 @@ class ToolWindow(QtWidgets.QWidget):
         Fill the results table from self.all_results, applying the active filter.
 
         Material column:
-          - Normal prediction: "wood"
-          - After override:    "rock *"  (asterisk = manually corrected)
-            Tooltip on the cell shows the original prediction.
+          "wood"     — normal prediction
+          "rock *"   — override set (asterisk = manually corrected)
+          Tooltip on overridden cell shows the original prediction.
 
         Confidence column:
-          - Normal:          "99.4%"
-          - After override:  "manual"  (human-corrected, not ML-predicted)
+          High / Medium / Low — quality tier
+          "manual"            — override has been set
+          Tooltip shows the raw percentage on every row.
 
-        Status column shows current status. Clicking it cycles the status.
-        Each row stores its index into self.all_results via UserRole.
+        Status column cycles on click. All other columns open detail panel.
         """
         self.table.clear()
 
@@ -453,31 +483,30 @@ class ToolWindow(QtWidgets.QWidget):
             if self.active_filter != "all" and effective_label != self.active_filter:
                 continue
 
-            # Confidence cell — "manual" when overridden, percentage otherwise
+            # Confidence cell
             if entry["override"]:
-                confidence_str = "manual"
+                conf_str     = "manual"
+                conf_tooltip = f"Manually overridden — original confidence: {entry['confidence'] * 100:.1f}%"
             else:
-                confidence_str = (
+                conf_str     = confidence_tier(entry["confidence"])
+                conf_tooltip = (
                     f"{entry['confidence'] * 100:.1f}%"
                     if entry["confidence"] > 0 else "—"
                 )
 
-            # Material cell — asterisk signals manual correction
-            if entry["override"]:
-                material_str = f"{entry['override']} *"
-            else:
-                material_str = entry["label"]
+            # Material cell
+            material_str = f"{entry['override']} *" if entry["override"] else entry["label"]
 
             row = QtWidgets.QTreeWidgetItem([
                 entry["short"],
                 material_str,
-                confidence_str,
+                conf_str,
                 entry["status"].capitalize(),
             ])
 
             row.setData(0, QtCore.Qt.UserRole, i)
+            row.setToolTip(COL_CONFIDENCE, conf_tooltip)
 
-            # Tooltip on overridden Material cell shows what the original was
             if entry["override"]:
                 row.setToolTip(COL_MATERIAL,
                     f"Manually overridden — original prediction: {entry['label']}")
@@ -495,31 +524,28 @@ class ToolWindow(QtWidgets.QWidget):
             item = self.table.topLevelItem(i)
             if item.data(0, QtCore.Qt.UserRole) == result_index:
 
-                # Material cell
                 if entry["override"]:
                     item.setText(COL_MATERIAL, f"{entry['override']} *")
                     item.setToolTip(COL_MATERIAL,
                         f"Manually overridden — original prediction: {entry['label']}")
+                    item.setText(COL_CONFIDENCE, "manual")
+                    item.setToolTip(COL_CONFIDENCE,
+                        f"Manually overridden — original confidence: {entry['confidence'] * 100:.1f}%")
                 else:
                     item.setText(COL_MATERIAL, entry["label"])
                     item.setToolTip(COL_MATERIAL, "")
-
-                # Confidence cell
-                if entry["override"]:
-                    item.setText(COL_CONFIDENCE, "manual")
-                else:
-                    item.setText(COL_CONFIDENCE,
+                    item.setText(COL_CONFIDENCE, confidence_tier(entry["confidence"]))
+                    item.setToolTip(COL_CONFIDENCE,
                         f"{entry['confidence'] * 100:.1f}%"
-                        if entry["confidence"] > 0 else "—"
-                    )
+                        if entry["confidence"] > 0 else "—")
 
                 item.setText(COL_STATUS, entry["status"].capitalize())
                 return
 
     def _on_filter_changed(self, selected_category):
         """Rebuild the table for the newly selected filter category."""
-        self.active_filter  = selected_category
-        self._detail_index  = None
+        self.active_filter = selected_category
+        self._detail_index = None
         self.detail_group.setVisible(False)
         self._populate_table()
 
@@ -573,6 +599,9 @@ class ToolWindow(QtWidgets.QWidget):
         """
         Refresh footer counts and update the Organize button text to
         show how many items will actually be processed.
+
+        Accepts *_ so it can be connected directly to QCheckBox.stateChanged
+        which passes an integer argument.
         """
         accepted = sum(1 for e in self.all_results if e["status"] == "accepted")
         rejected = sum(1 for e in self.all_results if e["status"] == "rejected")
@@ -596,30 +625,78 @@ class ToolWindow(QtWidgets.QWidget):
         """
         Populate and show the detail panel for the given entry.
 
+        Reads live data from self.tools.results so paths are always
+        current after organize has moved files.
+
         Disconnects the override combo before populating to prevent
         _on_override_changed from firing during population.
-        Reconnects after population is complete.
         """
         self._detail_index = result_index
         entry     = self.all_results[result_index]
         transform = entry["transform"]
 
-        # Read live data — albedo_path may have changed if files were moved
-        live_data = self.tools.results.get(transform, {})
+        # Live result dict — paths may have changed if files were moved
+        live_data   = self.tools.results.get(transform, {})
+        albedo_path = live_data.get("albedo_path") or entry.get("albedo_path") or ""
+        all_paths   = live_data.get("all_paths") or entry.get("all_paths") or []
 
+        # ── Asset name ────────────────────────────────────────
+        asset_name = resolve_asset_name(albedo_path) if albedo_path else "—"
+        self.detail_asset.setText(asset_name)
+
+        # ── Source folder ─────────────────────────────────────
+        # Show the last two folder components so long paths stay readable.
+        if albedo_path:
+            src_folder = os.path.dirname(albedo_path)
+            parts      = src_folder.replace("\\", "/").split("/")
+            short_src  = "/".join(parts[-2:]) if len(parts) >= 2 else src_folder
+            self.detail_source.setText(short_src)
+            self.detail_source.setToolTip(src_folder)
+        else:
+            self.detail_source.setText("no texture connected")
+            self.detail_source.setToolTip("")
+
+        # ── Shader ───────────────────────────────────────────
+        # Shader is stored at scan time by get_shader_name() so it shows
+        # immediately before the artist has approved anything.
+        shader = live_data.get("shader") or entry.get("shader") or "—"
+        self.detail_shader.setText(shader)
+
+        # ── Maps detected ─────────────────────────────────────
+        # One filename per line — no checkmarks or bullet characters.
+        # Empty when no texture set was found (unclassifiable objects).
+        if all_paths:
+            self.detail_maps.setText(
+                "\n".join(os.path.basename(p) for p in all_paths)
+            )
+        else:
+            self.detail_maps.setText("—")
+
+        # ── Classification ────────────────────────────────────
+        # Normal:   "rock   (0.94 confidence)"
+        # Override: "material* (manual)"
+        label      = entry.get("override") or entry["label"]
+        confidence = entry["confidence"]
+        if entry["override"]:
+            self.detail_classification.setText(f"{entry['override']} * (manual)")
+        elif confidence > 0:
+            self.detail_classification.setText(f"{label}   ({confidence:.2f} confidence)")
+        else:
+            self.detail_classification.setText(label)
+
+        # ── Full confidence scores ────────────────────────────
         scores = entry.get("all_scores", {})
-        score_str = (
-            "\n".join(
-                f"{cat}: {val * 100:.1f}%"
-                for cat, val in sorted(scores.items(), key=lambda x: -(x[1] or 0))
-            ) if scores else "—"
-        )
+        if scores:
+            self.detail_scores.setText(
+                "\n".join(
+                    f"{cat}: {val * 100:.1f}%"
+                    for cat, val in sorted(scores.items(), key=lambda x: -(x[1] or 0))
+                )
+            )
+        else:
+            self.detail_scores.setText("—")
 
-        self.detail_object.setText(entry["short"])
-        self.detail_shader.setText(live_data.get("shader") or entry.get("shader") or "—")
-        self.detail_path.setText(live_data.get("albedo_path") or "no texture connected")
-        self.detail_scores.setText(score_str)
-
+        # ── Override dropdown ─────────────────────────────────
         # Disconnect before changing selection to prevent spurious signal
         if self._override_connected:
             self.override_combo.currentTextChanged.disconnect(self._on_override_changed)
@@ -629,7 +706,7 @@ class ToolWindow(QtWidgets.QWidget):
             idx = self.override_combo.findText(entry["override"])
             self.override_combo.setCurrentIndex(idx if idx >= 0 else 0)
         else:
-            self.override_combo.setCurrentIndex(0)   # "— keep —"
+            self.override_combo.setCurrentIndex(0)
 
         self.override_combo.currentTextChanged.connect(self._on_override_changed)
         self._override_connected = True
@@ -640,15 +717,25 @@ class ToolWindow(QtWidgets.QWidget):
         """
         Called when the artist changes the Override dropdown.
 
-        Stores the chosen label and immediately updates the Material column
-        to show "label *" and Confidence to show "manual" so corrections
-        are visible in the table without keeping the detail panel open.
+        Stores the chosen label, updates the table row immediately,
+        and refreshes the Classification line in the detail panel so
+        it shows "material* (manual)" as soon as an override is selected.
         """
         if self._detail_index is None:
             return
 
         entry             = self.all_results[self._detail_index]
         entry["override"] = None if text == "— keep —" else text
+
+        # Update classification line in the detail panel immediately
+        label      = entry.get("override") or entry["label"]
+        confidence = entry["confidence"]
+        if entry["override"]:
+            self.detail_classification.setText(f"{entry['override']} * (manual)")
+        elif confidence > 0:
+            self.detail_classification.setText(f"{label}   ({confidence:.2f} confidence)")
+        else:
+            self.detail_classification.setText(label)
 
         self._refresh_row(self._detail_index)
         self._update_footer()
@@ -716,7 +803,10 @@ class ToolWindow(QtWidgets.QWidget):
         chosen_dir = os.path.normpath(chosen_dir)
         n          = len(accepted)
         word       = "item" if n == 1 else "items"
-        dry_note   = "\n\nDry Run is ON — no files will be moved or scene modified." if dry_run else ""
+        dry_note   = (
+            "\n\nDry Run is ON — no files will be moved or scene modified."
+            if dry_run else ""
+        )
 
         confirm = QtWidgets.QMessageBox(self)
         confirm.setWindowTitle("Organize Textures")
@@ -724,7 +814,7 @@ class ToolWindow(QtWidgets.QWidget):
         confirm.setInformativeText(
             f"For each accepted item this will:\n"
             f"  1. Write materialType + mlConfidence to the shader node\n"
-            f"  2. Move the texture into {chosen_dir}\\<category>\\\n"
+            f"  2. Move the texture set into {chosen_dir}\\<category>\\<asset>\\\n"
             f"  3. Update Maya's file texture paths automatically"
             f"{dry_note}\n\n"
             f"Rejected and Pending items will not be touched.\n"
@@ -777,11 +867,9 @@ class ToolWindow(QtWidgets.QWidget):
             f"{prefix}Done — " + (", ".join(parts) if parts else "nothing applied")
         )
 
-        # Refresh detail panel path if open — texture may have moved
+        # Refresh detail panel if open — source folder and maps may have changed
         if self.detail_group.isVisible() and self._detail_index is not None:
-            entry     = self.all_results[self._detail_index]
-            live_data = self.tools.results.get(entry["transform"], {})
-            self.detail_path.setText(live_data.get("albedo_path") or "no texture connected")
+            self._show_detail(self._detail_index)
 
         self.organize_btn.setEnabled(True)
         self._update_footer()
