@@ -1,118 +1,114 @@
-# ── pbr_tools.py ──────────────────────────────────────────────
+# ── pbr_tools.py ─────────────────────────────────────────────
 # Handles all Maya-side logic for the PBR ML Classifier.
 #
 # Responsibilities:
-#   1. Mesh collection   — find objects in the scene or selection
-#   2. Albedo extraction — find texture file paths from shading networks
-#   3. Classification    — predict material categories (scan only, no side effects)
-#   4. Apply approved    — write metadata + organize files for approved items only
+#   1. Mesh collection      — find objects in the scene or selection
+#   2. Texture set extraction — collect ALL connected map file paths per shader
+#   3. Classification       — predict material category from the albedo map
+#   4. Metadata writing     — stamp results onto shader nodes in the scene
+#   5. File organization    — move full texture sets into category subfolders
+#                             and update all Maya file nodes to new paths
 #
-# Intentional design decision:
-#   scan_and_classify() does NOT write metadata or move any files.
-#   It only runs the ML model and stores predictions.
-#   This gives the artist a chance to review, override, and approve
-#   results in the UI before anything in the scene or on disk is touched.
-#   The actual writes happen in apply_approved() only.
+# Design principle:
+#   scan_and_classify() does NOT write metadata or move files.
+#   It only runs ML inference and stores predictions.
+#   Everything destructive happens in apply_approved() after the
+#   artist has reviewed results in the UI.
+#
+# Known limitation (MVP):
+#   If multiple objects share the same albedo texture, the texture set
+#   is only moved once (for the first object encountered). Subsequent
+#   objects pointing to the same file will have their Maya file nodes
+#   updated but no duplicate move is attempted.
+#   TODO: surface this in the UI so artists can review shared textures.
 # ─────────────────────────────────────────────────────────────
 
 import os
 import shutil
 import maya.cmds as cmds
 
-# The model will not load until predict() is first called —
-# importing here does not slow down Maya startup.
 from classifier import predict
+from texture_name_parser import resolve_asset_name
 
-# Material categories the model was trained on.
-# Must match the order used during training.
 CLASSES = ["fabric", "ground", "metal", "rock", "wood"]
 
 
 class PBRTools:
     def __init__(self):
-        self.objects = []   # list of transform node paths collected by a scan
+        self.objects = []   # list of transform node paths to scan
         self.results = {}   # predictions stored by scan_and_classify()
 
     # ── Mesh collection ──────────────────────────────────────
 
     def get_selected_meshes(self):
         """
-        Return all mesh transforms found in the current selection,
-        including meshes inside groups and deeply nested hierarchies.
-
-        Why recursive?
-        When an artist selects a group, Maya only returns the group
-        transform — not the meshes inside it. A simple shapes check
-        on the group itself finds nothing because the meshes are
-        children of children. We recurse all the way down the
-        hierarchy to find every mesh regardless of nesting depth.
+        Return only the mesh transforms the artist has selected
+        in the Maya viewport.
         """
 
-        selection = cmds.ls(selection=True, long=True)
-        meshes    = []
+        # ls() with selection=True returns everything currently selected
+        selection = cmds.ls(selection=True, long=True, type="transform")
 
+        meshes = []
         for obj in selection:
-            self._collect_meshes_recursive(obj, meshes)
+            # Transforms can hold cameras, lights, locators etc.
+            # We only want transforms that have a mesh shape as a child.
+            shapes = cmds.listRelatives(obj, shapes=True, fullPath=True) or []
+            if shapes:
+                meshes.append(obj)
 
-        # Remove duplicates — selecting both a group and a child mesh
-        # would otherwise add that mesh twice.
-        seen          = set()
-        unique_meshes = []
-        for m in meshes:
-            if m not in seen:
-                seen.add(m)
-                unique_meshes.append(m)
-
-        self.objects = unique_meshes
-        return unique_meshes
-
-    def _collect_meshes_recursive(self, transform, results):
-        """
-        Walk down the hierarchy from transform and add any mesh
-        transforms found to the results list.
-
-        Handles any depth of nesting:
-          group1
-            group2
-              mesh1   ← found
-              mesh2   ← found
-            mesh3     ← found
-        """
-
-        shapes   = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
-        has_mesh = any(cmds.nodeType(s) == "mesh" for s in shapes)
-        if has_mesh:
-            results.append(transform)
-
-        children = cmds.listRelatives(
-            transform, children=True, fullPath=True, type="transform"
-        ) or []
-        for child in children:
-            self._collect_meshes_recursive(child, results)
+        self.objects = meshes
+        return meshes
 
     def get_all_scene_meshes(self):
-        """Return every mesh transform in the active Maya scene."""
+        """
+        Return every mesh transform in the active Maya scene.
+        """
 
+        # ls(type="mesh") returns mesh shape nodes — not their transforms.
+        # We need the transforms (the parent nodes) for the rest of the pipeline,
+        # so we go up one level with listRelatives(parent=True).
         all_meshes = cmds.ls(type="mesh", long=True)
         transforms = cmds.listRelatives(all_meshes, parent=True, fullPath=True) or []
 
-        # set() removes duplicates from transforms with multiple mesh shapes.
+        # A single transform can have multiple mesh shapes under it —
+        # set() removes any duplicates that would cause double scanning.
         self.objects = list(set(transforms))
         return self.objects
 
-    # ── Albedo extraction ────────────────────────────────────
+    # ── Texture set extraction ───────────────────────────────
+    # Collects ALL file texture nodes connected to a shader, not just
+    # the albedo. This is the production-correct approach — a texture
+    # set (albedo + normal + roughness etc.) should be organized together
+    # as a unit, not as individual files.
 
-    def get_albedo_path(self, transform):
+    def get_texture_set(self, transform):
         """
-        Follow the shading network from a mesh transform back to
-        its albedo (colour) texture and return the file path.
-        Returns None if no valid texture file is found.
+        Walk the shading network from a mesh transform and return every
+        file texture node connected to its shader.
 
-        How Maya shading works:
-          mesh shape
-            └── shading engine  (groups geometry with a material)
-                  └── surface shader  (the actual material node)
-                        └── file texture node  (points to the image on disk)
+        Returns a dict:
+            {
+                "albedo_path": "/path/to/albedo.png",   — used for ML classification
+                "all_paths":   [                         — all maps for this shader
+                    "/path/to/albedo.png",
+                    "/path/to/normal.png",
+                    "/path/to/roughness.png",
+                ],
+                "file_nodes":  ["file1", "file2", ...],  — Maya node names
+            }
+
+        Returns None if no shader or no connected file textures are found.
+
+        Why collect all maps?
+        When organizing, we move the entire texture set into one folder:
+            textures/rock/cliff_rock_a_v1/
+                cliff_rock_a_basecolor_v1.exr
+                cliff_rock_a_normal_v1.exr
+                cliff_rock_a_roughness_v1.exr
+
+        The albedo path is specifically identified because it is the one
+        passed to the ML classifier. The rest are moved alongside it.
         """
 
         shapes = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
@@ -123,30 +119,48 @@ class PBRTools:
         if not shading_engines:
             return None
 
+        albedo_path = None
+        all_paths   = []
+        file_nodes  = []
+
+        # Known albedo attribute names across common shader types
+        ALBEDO_ATTRS = ["baseColor", "color", "baseColorMap", "diffuseColor"]
+
         for sg in shading_engines:
             shaders = cmds.listConnections(f"{sg}.surfaceShader") or []
 
             for shader in shaders:
 
-                # Different shader types store the base colour in different attributes:
-                #   aiStandardSurface (Arnold) → baseColor
-                #   Lambert, Blinn, Phong      → color
-                #   Other PBR shaders          → baseColorMap, diffuseColor
-                for attr in ["baseColor", "color", "baseColorMap", "diffuseColor"]:
-
+                # ── Find the albedo path first ────────────────
+                # Try known albedo attributes before falling back to any file node
+                for attr in ALBEDO_ATTRS:
                     if not cmds.attributeQuery(attr, node=shader, exists=True):
                         continue
+                    for fn in cmds.listConnections(f"{shader}.{attr}", type="file") or []:
+                        p = cmds.getAttr(f"{fn}.fileTextureName")
+                        if p and os.path.exists(p) and albedo_path is None:
+                            albedo_path = p
 
-                    connected_files = cmds.listConnections(
-                        f"{shader}.{attr}", type="file"
-                    ) or []
+                # ── Collect ALL file nodes on this shader ─────
+                for fn in cmds.listConnections(shader, type="file") or []:
+                    p = cmds.getAttr(f"{fn}.fileTextureName")
+                    if p and os.path.exists(p) and fn not in file_nodes:
+                        all_paths.append(p)
+                        file_nodes.append(fn)
 
-                    for file_node in connected_files:
-                        path = cmds.getAttr(f"{file_node}.fileTextureName")
-                        if path and os.path.exists(path):
-                            return path
+        if not all_paths:
+            return None
 
-        return None
+        # If no dedicated albedo attribute was found, fall back to the
+        # first connected file texture
+        if albedo_path is None and all_paths:
+            albedo_path = all_paths[0]
+
+        return {
+            "albedo_path": albedo_path,
+            "all_paths":   all_paths,
+            "file_nodes":  file_nodes,
+        }
 
     # ── Metadata writing ─────────────────────────────────────
 
@@ -155,22 +169,23 @@ class PBRTools:
         Write the predicted material type and confidence score onto
         the shader node as custom attributes in the Maya scene.
 
-        Only called from apply_approved() — never during scanning.
-        This ensures the scene is not modified until the artist
-        has reviewed and approved the predictions.
+        Why write to the shader? The data travels with the .mb/.ma file.
+        Any artist who opens the scene later can read what the classifier
+        predicted without needing to re-run the tool.
 
         Attributes written:
           materialType  (string) — e.g. "wood"
           mlConfidence  (float)  — e.g. 0.9943
 
-        Returns the shader node name.
+        Returns the shader node name so the caller does not need to
+        traverse the shading network again just to get the name.
         """
 
         shapes = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
         if not shapes:
             return None
 
-        shader_name     = None
+        shader_name = None
         shading_engines = cmds.listConnections(shapes, type="shadingEngine") or []
 
         for sg in shading_engines:
@@ -178,8 +193,9 @@ class PBRTools:
 
             for shader in shaders:
 
-                # addAttr only if the attribute doesn't already exist —
-                # running the tool twice would error otherwise.
+                # Only add the attribute if it does not already exist.
+                # Without this check, running the tool twice on the same
+                # scene would throw an error because the attribute already exists.
                 if not cmds.attributeQuery("materialType", node=shader, exists=True):
                     cmds.addAttr(shader, longName="materialType",
                                  dataType="string", keyable=False)
@@ -190,56 +206,59 @@ class PBRTools:
                                  attributeType="float", keyable=False)
                 cmds.setAttr(f"{shader}.mlConfidence", confidence)
 
+                # Capture the shader name so we can return it —
+                # this avoids traversing the shading network a second time
                 shader_name = shader
-                print(f"[pbr_tools] Tagged {shader} → {label} ({confidence*100:.1f}%)")
+                print(f"[SceneScanner] Tagged {shader} → {label} ({confidence*100:.1f}%)")
 
         return shader_name
 
-    # ── Scan pipeline (predict only — no side effects) ────────
+    # ── Full scan pipeline ───────────────────────────────────
 
     def scan_and_classify(self, progress_callback=None):
         """
-        Scan every object in self.objects, run the ML model, and store
-        predictions in self.results.
+        The main pipeline. Runs all steps across every object in self.objects.
 
-        This method intentionally does NOT:
-          - write any attributes to shader nodes
-          - move any files on disk
-          - modify the Maya scene in any way
+        Split into three phases:
+          Phase 1 — collect albedo texture paths for all objects
+          Phase 2 — classify every texture using classifier.predict()
+          Phase 3 — write metadata to shader nodes and store results for the UI
 
-        All of that happens later in apply_approved(), only after the
-        artist has reviewed and approved the predictions in the UI.
-
-        Phase 1 — collect albedo texture paths for all objects
-        Phase 2 — classify every texture using classifier.predict()
-        Phase 3 — store results (no writes)
+        Why collect all paths first?
+        classifier.predict() loads the model on the very first call (~2s).
+        After that every prediction is fast (~50-100ms).
+        By collecting paths first we can give the artist clear progress feedback
+        and avoid loading the model for objects that have no texture at all.
 
         progress_callback(current, total, name) is optional.
+        The UI passes one in so the status bar updates during long scans.
         """
 
         self.results = {}
-        total        = len(self.objects)
+        total = len(self.objects)
 
-        # ── Phase 1: collect albedo paths ────────────────────
+        # ── Phase 1: collect texture sets ───────────────────
+        # Walk the shading network for every object and collect the
+        # full texture set (albedo + all sibling maps).
 
         if progress_callback:
             progress_callback(0, total, "Collecting textures...")
 
-        albedo_map = {}
+        texture_sets = {}
         for transform in self.objects:
-            albedo_map[transform] = self.get_albedo_path(transform)
+            texture_sets[transform] = self.get_texture_set(transform)
 
-        classifiable   = {t: p for t, p in albedo_map.items() if p}
-        unclassifiable = {t: p for t, p in albedo_map.items() if not p}
+        classifiable   = {t: ts for t, ts in texture_sets.items() if ts}
+        unclassifiable = {t: ts for t, ts in texture_sets.items() if not ts}
 
-        # Objects with no texture are stored immediately as unknown
         for transform in unclassifiable:
             short = transform.split("|")[-1]
-            print(f"[pbr_tools] No albedo found for {short} — skipping")
+            print(f"[pbr_tools] No textures found for {short} — skipping")
             self.results[transform] = {
                 "label":       "unknown",
                 "confidence":  0.0,
                 "albedo_path": None,
+                "all_paths":   [],
                 "all_scores":  {},
                 "shader":      None,
             }
@@ -247,22 +266,23 @@ class PBRTools:
         if not classifiable:
             return self.results
 
-        # ── Phase 2: classify all textures ───────────────────
-        # predict() loads the model on the first call and keeps it in memory.
-        # Every call after the first is fast (~50-100ms).
+        # ── Phase 2: classify using the albedo from each set ──
+        # ML only needs the albedo — the rest of the set travels with it
+        # during file organization but doesn't affect the prediction.
+
+        if progress_callback:
+            progress_callback(0, total, "Loading model...")
 
         transforms_list = list(classifiable.keys())
-        paths_list      = list(classifiable.values())
-        predictions     = [predict(path) for path in paths_list]
+        sets_list       = list(classifiable.values())
+        predictions     = [predict(ts["albedo_path"]) for ts in sets_list]
 
-        # ── Phase 3: store results — no metadata writes yet ──
-        # write_metadata() is deliberately NOT called here.
-        # The artist reviews predictions in the UI first.
+        # ── Phase 3: store results — no writes yet ────────────
 
         for i, transform in enumerate(transforms_list):
-            short       = transform.split("|")[-1]
-            albedo_path = paths_list[i]
-            prediction  = predictions[i]
+            short      = transform.split("|")[-1]
+            tex_set    = sets_list[i]
+            prediction = predictions[i]
 
             if progress_callback:
                 progress_callback(i + 1, total, short)
@@ -272,7 +292,8 @@ class PBRTools:
                 self.results[transform] = {
                     "label":       "error",
                     "confidence":  0.0,
-                    "albedo_path": albedo_path,
+                    "albedo_path": tex_set["albedo_path"],
+                    "all_paths":   tex_set["all_paths"],
                     "all_scores":  {},
                     "shader":      None,
                 }
@@ -281,65 +302,70 @@ class PBRTools:
             self.results[transform] = {
                 "label":       prediction["label"],
                 "confidence":  prediction["confidence"],
-                "albedo_path": albedo_path,
+                "albedo_path": tex_set["albedo_path"],
+                "all_paths":   tex_set["all_paths"],    # full set for organize step
                 "all_scores":  prediction.get("all_scores", {}),
-                "shader":      None,   # filled in by write_metadata() during apply
+                "shader":      None,
             }
 
-            print(f"[pbr_tools] {short} → {prediction['label']} ({prediction['confidence']*100:.1f}%)")
+            n_maps = len(tex_set["all_paths"])
+            print(f"[pbr_tools] {short} → {prediction['label']} "
+                  f"({prediction['confidence']*100:.1f}%) | {n_maps} map(s) found")
 
         return self.results
 
     # ── Apply approved ────────────────────────────────────────
+    # Writes metadata and moves full texture sets for approved items.
+    # Called only after the artist has reviewed predictions in the UI.
 
     def apply_approved(self, review_queue, output_dir, dry_run=False, progress_callback=None):
         """
-        Apply the artist-approved predictions — write metadata to shader
-        nodes and move texture files on disk.
+        Write materialType metadata to shader nodes and move full texture
+        sets into organized category subfolders for all accepted items.
 
         Only items with status == "accepted" are processed.
-        Items with status == "rejected" or "pending" are skipped entirely.
+        Rejected and Pending items are completely untouched.
 
-        If the artist set an override label on a row, that label is used
-        instead of the original ML prediction when writing metadata and
-        deciding which category subfolder to move the texture into.
+        If an override label is set on an entry, that label is used instead
+        of the original ML prediction for both metadata and folder routing.
+
+        Texture set organization:
+            Each accepted object's full texture set (albedo + normal +
+            roughness + any other connected maps) is moved together into:
+                <output_dir>/<category>/<asset_name>/
+                    asset_basecolor.png
+                    asset_normal.png
+                    asset_roughness.png
+
+            The asset_name is derived by stripping map type tokens from
+            the albedo filename using texture_name_parser.resolve_asset_name().
+
+        Known limitation (MVP):
+            If two objects share the same albedo texture (and therefore the
+            same texture set), the set is moved on the first object and
+            skipped on the second. Both objects' Maya file nodes are updated
+            correctly. This case is not yet surfaced in the UI.
+            TODO: detect shared textures during scan and group them.
 
         dry_run=True logs every action to the Script Editor but makes
-        no changes to the scene or the file system. Use this to preview
-        exactly what will happen before committing.
-
-        review_queue is the list of entry dicts built by the UI:
-          [
-            {
-              "transform":  "|pPlane1",
-              "short":      "pPlane1",
-              "label":      "wood",         — original ML prediction
-              "confidence": 0.994,
-              "override":   None,           — or "rock" if artist changed it
-              "status":     "accepted",     — "accepted" | "rejected" | "pending"
-              "albedo_path": "C:/tex/...",
-            },
-            ...
-          ]
+        no changes to the Maya scene or the file system.
 
         Returns:
-          {
-            "metadata_written": int,   — shader nodes tagged
-            "files_moved":      int,   — texture files moved on disk
-            "skipped":          int,   — already in right place or name conflict
-            "failed":           int,   — errors during move
-          }
+            {
+                "metadata_written": int,
+                "files_moved":      int,
+                "skipped":          int,
+                "failed":           int,
+            }
         """
 
         prefix = "[DRY RUN]" if dry_run else "[pbr_tools]"
 
-        # ── Step 1: filter to accepted items only ─────────────
-
         accepted = [
-            entry for entry in review_queue
-            if entry.get("status") == "accepted"
-            and entry.get("albedo_path")
-            and entry.get("label") not in (None, "unknown", "error")
+            e for e in review_queue
+            if e.get("status") == "accepted"
+            and e.get("albedo_path")
+            and e.get("label") not in (None, "unknown", "error")
         ]
 
         if not accepted:
@@ -352,123 +378,153 @@ class PBRTools:
         skipped          = 0
         failed           = 0
 
-        # Tracks old → new path for updating Maya's file nodes after all moves.
-        # Format: { normalized_old_path: new_path }
-        old_to_new = {}
+        # Maps old normalized path → new path for updating Maya file nodes
+        old_to_new: dict[str, str] = {}
 
-        # Tracks paths already processed this run to avoid moving the same
-        # texture twice when multiple objects share the same file.
-        processed_paths = set()
+        # Tracks albedo paths already processed to avoid moving the same
+        # texture set twice when multiple objects share a texture.
+        # See known limitation in docstring above.
+        processed_albedos: set[str] = set()
 
         for i, entry in enumerate(accepted):
             transform   = entry["transform"]
             short       = entry["short"]
             confidence  = entry["confidence"]
             albedo_path = entry["albedo_path"]
+            label       = entry.get("override") or entry["label"]
 
-            # Use the override label if the artist changed it,
-            # otherwise use the original ML prediction.
-            label = entry.get("override") or entry["label"]
+            # all_paths comes from the texture set collected during scan.
+            # Fall back to just the albedo if it was never populated.
+            all_paths = self.results.get(transform, {}).get("all_paths") or [albedo_path]
 
             if progress_callback:
                 progress_callback(i + 1, total, short)
 
-            # ── Write metadata to the shader node ────────────
+            # ── Write metadata ────────────────────────────────
 
             if dry_run:
-                print(f"{prefix} Would tag shader on '{short}' → materialType={label}, mlConfidence={confidence}")
+                print(f"{prefix} Would tag '{short}' → materialType={label}, mlConfidence={confidence}")
             else:
                 shader = self.write_metadata(transform, label, confidence)
-                # Update self.results so the detail panel reflects the
-                # final applied label (which may differ from the prediction
-                # if the artist used an override).
                 if transform in self.results:
                     self.results[transform]["shader"] = shader
                     self.results[transform]["label"]  = label
                 metadata_written += 1
 
-            # ── Move the texture file ─────────────────────────
+            # ── Move texture set ──────────────────────────────
 
             if not output_dir:
                 continue
 
-            normalized_src = os.path.normpath(albedo_path)
+            norm_albedo = os.path.normpath(albedo_path)
 
-            # Skip if we already moved this exact file earlier in the loop.
-            # This handles the case where multiple objects share one texture.
-            if normalized_src in processed_paths:
+            # Skip if this texture set was already moved by an earlier entry
+            if norm_albedo in processed_albedos:
+                print(f"{prefix} Skipping shared texture set for {short} — already moved")
                 continue
-            processed_paths.add(normalized_src)
+            processed_albedos.add(norm_albedo)
 
-            dest_folder = os.path.join(os.path.normpath(output_dir), label)
-            dest_path   = os.path.normpath(
-                os.path.join(dest_folder, os.path.basename(albedo_path))
+            # Derive the asset subfolder name from the albedo filename
+            asset_name  = resolve_asset_name(albedo_path)
+            dest_folder = os.path.normpath(
+                os.path.join(output_dir, label, asset_name)
             )
 
-            # Already in the right place — nothing to do
-            if normalized_src == dest_path:
-                print(f"{prefix} Already organized: {os.path.basename(albedo_path)}")
-                skipped += 1
-                continue
-
-            # A different file with the same name already exists — skip
-            if os.path.exists(dest_path):
-                print(f"{prefix} Skipping — file already exists at destination: {dest_path}")
-                skipped += 1
-                continue
-
             if dry_run:
-                print(f"{prefix} Would move: {albedo_path}  →  {label}/{os.path.basename(albedo_path)}")
-                files_moved += 1   # count what would be moved for the dry run summary
-            else:
-                try:
-                    os.makedirs(dest_folder, exist_ok=True)
-                    # shutil.move works across drives; os.rename does not.
-                    shutil.move(albedo_path, dest_path)
-                    old_to_new[normalized_src] = dest_path
+                print(f"{prefix} Would create folder: {dest_folder}/")
+
+            for src in all_paths:
+                norm_src  = os.path.normpath(src)
+                dest_file = os.path.normpath(
+                    os.path.join(dest_folder, os.path.basename(src))
+                )
+
+                if norm_src == dest_file:
+                    print(f"{prefix} Already organized: {os.path.basename(src)}")
+                    skipped += 1
+                    continue
+
+                if os.path.exists(dest_file):
+                    print(f"{prefix} Skipping — exists at destination: {dest_file}")
+                    skipped += 1
+                    continue
+
+                if dry_run:
+                    print(f"{prefix} Would move: {os.path.basename(src)}"
+                          f"  →  {label}/{asset_name}/{os.path.basename(src)}")
                     files_moved += 1
-                    print(f"{prefix} Moved → {label}/{os.path.basename(albedo_path)}")
+                else:
+                    try:
+                        os.makedirs(dest_folder, exist_ok=True)
+                        shutil.move(src, dest_file)
+                        old_to_new[norm_src] = dest_file
+                        files_moved += 1
+                        print(f"{prefix} Moved → {label}/{asset_name}/{os.path.basename(src)}")
+                    except Exception as err:
+                        print(f"{prefix} Failed to move {os.path.basename(src)}: {err}")
+                        failed += 1
 
-                except Exception as error:
-                    print(f"{prefix} Failed to move {os.path.basename(albedo_path)}: {error}")
-                    failed += 1
+            # ── Remove empty source folder ────────────────────
+            # After moving all files in a texture set, check if the
+            # folder they came from is now empty and remove it if so.
+            #
+            # This cleans up leftover artifact folders when the artist
+            # re-organizes to a different destination — e.g. moved to
+            # /textures2/ by mistake, then re-organized to /textures/.
+            # Without this step /textures2/rock/cliff_rock_a_v1/ would
+            # sit there empty and look like a duplicate asset.
+            #
+            # Safety rules:
+            #   1. Only remove if the folder exists on disk
+            #   2. Only remove if it is completely empty
+            #   3. Only remove the immediate asset folder — never parents
+            #
+            # We deliberately do NOT walk up the directory tree or use
+            # shutil.rmtree(). Studios often have refs/, previews/, or
+            # zbrush/ folders above the asset folder that must never
+            # be touched by this tool.
 
-        # ── Step 2: update Maya's file texture nodes ──────────
-        # After moving files, every file node that referenced an old path
-        # must be updated to the new path — otherwise Maya shows the
-        # red X missing texture warning in the viewport.
-        # Skipped entirely during a dry run.
+            if not dry_run and all_paths:
+                src_folder = os.path.dirname(os.path.normpath(all_paths[0]))
+                try:
+                    if os.path.isdir(src_folder) and not os.listdir(src_folder):
+                        os.rmdir(src_folder)
+                        print(f"[pbr_tools] Removed empty folder: {src_folder}")
+                except Exception as err:
+                    # Non-fatal — a leftover empty folder is annoying
+                    # but not worth interrupting the artist over.
+                    print(f"[pbr_tools] Could not remove empty folder {src_folder}: {err}")
+
+        # ── Update Maya file nodes ────────────────────────────
 
         if old_to_new and not dry_run:
             print(f"[pbr_tools] Updating Maya file texture paths...")
 
             for file_node in cmds.ls(type="file") or []:
-                current_path = cmds.getAttr(f"{file_node}.fileTextureName")
-                if not current_path:
+                current = cmds.getAttr(f"{file_node}.fileTextureName")
+                if not current:
                     continue
+                norm = os.path.normpath(current)
+                if norm in old_to_new:
+                    cmds.setAttr(f"{file_node}.fileTextureName",
+                                 old_to_new[norm], type="string")
+                    print(f"[pbr_tools] Updated '{file_node}' → {old_to_new[norm]}")
 
-                normalized_current = os.path.normpath(current_path)
-                if normalized_current in old_to_new:
-                    new_path = old_to_new[normalized_current]
-                    cmds.setAttr(
-                        f"{file_node}.fileTextureName", new_path, type="string"
-                    )
-                    print(f"[pbr_tools] Updated '{file_node}' → {new_path}")
-
-            # Update self.results so the UI detail panel shows the new paths
-            # without needing a full re-scan after applying.
+            # Update self.results so the detail panel shows new paths
             for transform, data in self.results.items():
-                old_path = data.get("albedo_path")
-                if old_path:
-                    normalized = os.path.normpath(old_path)
-                    if normalized in old_to_new:
-                        self.results[transform]["albedo_path"] = old_to_new[normalized]
+                for key in ("albedo_path",):
+                    p = data.get(key)
+                    if p and os.path.normpath(p) in old_to_new:
+                        data[key] = old_to_new[os.path.normpath(p)]
+                if "all_paths" in data:
+                    data["all_paths"] = [
+                        old_to_new.get(os.path.normpath(p), p)
+                        for p in data["all_paths"]
+                    ]
 
-        print(
-            f"{prefix} Apply complete — "
-            f"{metadata_written} tagged, {files_moved} moved, "
-            f"{skipped} skipped, {failed} failed"
-        )
+        print(f"{prefix} Apply complete — "
+              f"{metadata_written} tagged, {files_moved} moved, "
+              f"{skipped} skipped, {failed} failed")
 
         return {
             "metadata_written": metadata_written,
