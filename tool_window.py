@@ -30,14 +30,17 @@ from PySide6 import QtWidgets, QtCore
 from maya import OpenMayaUI as omui
 from shiboken6 import wrapInstance
 import maya.cmds as cmds
+from widgets.collapsable import CollapsibleContainer
 
 from pbr_tools import PBRTools, CLASSES
 
 try:
     from texture_name_parser import resolve_asset_name
 except ImportError:
+
     def resolve_asset_name(path):
         return os.path.splitext(os.path.basename(path))[0] if path else "—"
+
 
 # Filter options shown in the dropdown above the table
 CATEGORIES = ["all", "wood", "rock", "metal", "ground", "fabric"]
@@ -50,13 +53,13 @@ AUTO_ACCEPT_THRESHOLD = 0.90
 STATUS_CYCLE = {"pending": "accepted", "accepted": "rejected", "rejected": "pending"}
 
 # Column indices — defined once so changes only happen here
-COL_OBJECT     = 0
-COL_MATERIAL   = 1
+COL_OBJECT = 0
+COL_MATERIAL = 1
 COL_CONFIDENCE = 2
-COL_STATUS     = 3
+COL_STATUS = 3
 
 # Confidence tier thresholds
-CONF_HIGH   = 0.80
+CONF_HIGH = 0.80
 CONF_MEDIUM = 0.50
 
 
@@ -125,8 +128,8 @@ class ToolWindow(QtWidgets.QWidget):
 
         self.setWindowTitle("PBR Material Classifier")
         self.setMinimumWidth(600)
-        self.setMinimumHeight(800)
-        self.resize(600, 800)
+        self.setMinimumHeight(900)
+        self.resize(600, 900)
 
         self.setWindowFlags(QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
@@ -147,86 +150,81 @@ class ToolWindow(QtWidgets.QWidget):
         root.setSpacing(4)
 
         # ── Scan buttons ──────────────────────────────────────
-
-        scan_row = QtWidgets.QHBoxLayout()
+        
+        scan_box = QtWidgets.QGroupBox("Scan")
+        scan_layout = QtWidgets.QHBoxLayout(scan_box)
+        scan_box.setFlat(False)
+        scan_box.setCheckable(False)
 
         self.scan_scene_btn = QtWidgets.QPushButton("Scan Scene")
-        self.scan_scene_btn.setToolTip(
-            "Classify all mesh objects in the scene.\n"
-            "Results appear in the review table — nothing is written until you organize."
-        )
-        self.scan_scene_btn.clicked.connect(self.run_scan_scene)
-
         self.scan_selection_btn = QtWidgets.QPushButton("Scan Selection")
-        self.scan_selection_btn.setToolTip(
-            "Classify only the currently selected mesh objects.\n"
-            "Results appear in the review table — nothing is written until you organize."
-        )
+
+        self.scan_scene_btn.clicked.connect(self.run_scan_scene)
         self.scan_selection_btn.clicked.connect(self.run_scan_selection)
 
-        scan_row.addWidget(self.scan_scene_btn)
-        scan_row.addWidget(self.scan_selection_btn)
-        root.addLayout(scan_row)
+        scan_layout.addWidget(self.scan_scene_btn)
+        scan_layout.addWidget(self.scan_selection_btn)
 
-        root.addWidget(self._make_separator())
+        root.addWidget(scan_box)
 
-        # ── Output path + Organize ────────────────────────────
+        # ── Output Texture Folder Path ────────────────────────────
 
-        root.addWidget(QtWidgets.QLabel("Move textures to:"))
-
-        path_row = QtWidgets.QHBoxLayout()
+        texture_folder_box = QtWidgets.QGroupBox("Output Texture Folder")
+        texture_folder_layout = QtWidgets.QHBoxLayout(texture_folder_box)
+        texture_folder_box.setFlat(False)
+        texture_folder_box.setCheckable(False)
 
         self.output_path_field = QtWidgets.QLineEdit()
-        self.output_path_field.setPlaceholderText("Choose or type a destination folder...")
+        self.output_path_field.setPlaceholderText(
+            "Choose or type a destination folder for your textures..."
+        )
         self.output_path_field.setToolTip(
             "Textures will be moved into category subfolders inside this folder.\n"
             "e.g. <folder>/wood/   <folder>/metal/   etc."
         )
-        path_row.addWidget(self.output_path_field)
+        texture_folder_layout.addWidget(self.output_path_field)
 
         self.browse_btn = QtWidgets.QPushButton("Browse")
         self.browse_btn.setFixedWidth(60)
         self.browse_btn.setToolTip("Open a folder picker to choose the destination")
         self.browse_btn.clicked.connect(self._on_browse_clicked)
-        path_row.addWidget(self.browse_btn)
+        texture_folder_layout.addWidget(self.browse_btn)
 
-        root.addLayout(path_row)
+        root.addWidget(texture_folder_box)
 
-        self.organize_btn = QtWidgets.QPushButton("Organize Textures")
-        self.organize_btn.setToolTip(
-            "Write material tags to shaders and move textures on disk\n"
-            "for Accepted items only.\n"
-            "Rejected and Pending items are not touched.\n"
-            "Maya's file texture paths will be updated automatically."
-        )
-        self.organize_btn.setEnabled(False)
-        self.organize_btn.clicked.connect(self._on_organize_clicked)
-        root.addWidget(self.organize_btn)
-
-        root.addWidget(self._make_separator())
-
-        # ── Batch controls ────────────────────────────────────
+        # ── Review Section ────────────────────────────────────
         # One-click operations that update statuses across multiple rows.
         # Dry Run toggle prevents any scene or disk changes when checked.
 
+        review_box = QtWidgets.QGroupBox("Review")
+        review_layout = QtWidgets.QVBoxLayout(review_box)
+
+        review_box.setFlat(False)
+        review_box.setCheckable(False)
+
+        # ── Review Section: Batch Controls ─────────────────
         batch_row = QtWidgets.QHBoxLayout()
 
-        self.accept_high_btn = QtWidgets.QPushButton("Accept >90%")
+        self.accept_high_btn = QtWidgets.QPushButton("Accept High")
         self.accept_high_btn.setToolTip(
-            "Set status to Accepted for all items with confidence above 90%"
+            "Set status to Accepted for all high-confidence items\n"
+            f"(currently {int(AUTO_ACCEPT_THRESHOLD * 100)}% and above)"
         )
         self.accept_high_btn.setEnabled(False)
         self.accept_high_btn.clicked.connect(self._batch_accept_high)
 
-        self.reject_low_btn = QtWidgets.QPushButton("Reject <50%")
+        self.reject_low_btn = QtWidgets.QPushButton("Reject Low")
         self.reject_low_btn.setToolTip(
-            "Set status to Rejected for all items with confidence below 50%"
+            "Set status to Rejected for all low-confidence items\n"
+            "(currently below 50%)"
         )
         self.reject_low_btn.setEnabled(False)
         self.reject_low_btn.clicked.connect(self._batch_reject_low)
 
         self.reset_btn = QtWidgets.QPushButton("Reset All")
-        self.reset_btn.setToolTip("Reset all statuses to Pending and clear all overrides")
+        self.reset_btn.setToolTip(
+            "Reset all statuses to Pending and clear all overrides"
+        )
         self.reset_btn.setEnabled(False)
         self.reset_btn.clicked.connect(self._batch_reset)
 
@@ -242,9 +240,9 @@ class ToolWindow(QtWidgets.QWidget):
         batch_row.addWidget(self.reset_btn)
         batch_row.addStretch()
         batch_row.addWidget(self.dry_run_chk)
-        root.addLayout(batch_row)
+        review_layout.addLayout(batch_row)
 
-        # ── Filter dropdown ───────────────────────────────────
+        # ── Review Section: Filter dropdown ───────────────────────────────────
 
         filter_row = QtWidgets.QHBoxLayout()
         filter_row.addWidget(QtWidgets.QLabel("Show:"))
@@ -255,9 +253,9 @@ class ToolWindow(QtWidgets.QWidget):
         self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.filter_combo)
         filter_row.addStretch()
-        root.addLayout(filter_row)
+        review_layout.addLayout(filter_row)
 
-        # ── Results table ─────────────────────────────────────
+        # ── Review Section: Results table ─────────────────────────────────────
         # Four columns: Object | Material | Confidence | Status
         #
         # Material  — shows "rock *" when an override is set
@@ -267,36 +265,38 @@ class ToolWindow(QtWidgets.QWidget):
 
         self.table = QtWidgets.QTreeWidget()
         self.table.setHeaderLabels(["Object", "Material", "Confidence", "Status"])
-        self.table.setColumnWidth(COL_OBJECT,      150)
-        self.table.setColumnWidth(COL_MATERIAL,    150)
-        self.table.setColumnWidth(COL_CONFIDENCE,   90)
-        self.table.setColumnWidth(COL_STATUS,       80)
+        self.table.setColumnWidth(COL_OBJECT, 200)
+        self.table.setColumnWidth(COL_MATERIAL, 100)
+        self.table.setColumnWidth(COL_CONFIDENCE, 120)
+        self.table.setColumnWidth(COL_STATUS, 80)
         self.table.setRootIsDecorated(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.setToolTip(
-            "Click Status to cycle: Pending → Accepted → Rejected\n"
+            "Click Status for Staging: Pending → Accepted → Rejected\n"
             "Click any other column to open the detail panel.\n"
-            "Use Override in the detail panel to correct a wrong prediction.\n"
-            "An asterisk (*) in Material means manually overridden.\n"
+            "Use Override in the detail panel to correct material assignment.\n"
+            "An asterisk (*) in Material means manually overridden or corrected assignment.\n"
             "Hover Confidence to see the raw score."
         )
         self.table.headerItem().setToolTip(
             COL_CONFIDENCE,
             "High = 80%+   Medium = 50-80%   Low = below 50%\n"
-            "Hover any row to see the exact confidence score."
+            "Hover any row to see the exact confidence score.",
         )
         self.table.itemClicked.connect(self._on_table_clicked)
-        root.addWidget(self.table, stretch=1)
+        review_layout.addWidget(self.table, stretch=1)
 
-        # ── Footer counts ─────────────────────────────────────
+        # ── Review Section: Footer counts ─────────────────────────────────────
 
         self.footer_label = QtWidgets.QLabel("—")
         self.footer_label.setAlignment(QtCore.Qt.AlignLeft)
-        root.addWidget(self.footer_label)
+        review_layout.addWidget(self.footer_label)
 
-        root.addWidget(self._make_separator())
+        # Add the grouped Review box into the main layout, then separate
+        root.addWidget(review_box)
 
+ 
         # ── Detail panel ──────────────────────────────────────
         # Hidden until the artist clicks a row.
         # Override dropdown lives here — not in the table — so the table
@@ -308,7 +308,7 @@ class ToolWindow(QtWidgets.QWidget):
         detail_layout.setContentsMargins(6, 8, 6, 8)
         detail_layout.setSpacing(6)
 
-        self.detail_asset  = QtWidgets.QLabel("—")
+        self.detail_asset = QtWidgets.QLabel("—")
 
         self.detail_source = QtWidgets.QLabel("—")
         self.detail_source.setWordWrap(True)
@@ -320,7 +320,7 @@ class ToolWindow(QtWidgets.QWidget):
         self.detail_maps.setWordWrap(True)
         self.detail_maps.setTextFormat(QtCore.Qt.PlainText)
 
-        # Classification — predicted label + confidence, or "manual (manual)" if overridden
+        # Classification — predicted label + confidence, or "material* (manual)" if overridden
         self.detail_classification = QtWidgets.QLabel("—")
 
         self.detail_scores = QtWidgets.QLabel("—")
@@ -339,20 +339,35 @@ class ToolWindow(QtWidgets.QWidget):
             "The corrected label is used when organizing textures."
         )
 
-        detail_layout.addRow("Asset:",          self.detail_asset)
-        detail_layout.addRow("Source folder:",  self.detail_source)
-        detail_layout.addRow("Shader:",         self.detail_shader)
-        detail_layout.addRow("Maps detected:",  self.detail_maps)
+        detail_layout.addRow("Asset:", self.detail_asset)
+        detail_layout.addRow("Source folder:", self.detail_source)
+        detail_layout.addRow("Shader:", self.detail_shader)
+        detail_layout.addRow("Maps:", self.detail_maps)
         detail_layout.addRow("Classification:", self.detail_classification)
-        detail_layout.addRow("Scores:",         self.detail_scores)
-        detail_layout.addRow("Override:",       self.override_combo)
+        detail_layout.addRow("Confidence Scores:", self.detail_scores)
+        detail_layout.addRow("Override:", self.override_combo)
 
         self.detail_group.setVisible(False)
         root.addWidget(self.detail_group)
 
-        # ── Status bar ────────────────────────────────────────
+        # ── Organize button ───────────────────────────────────
+        root.addWidget(self._make_separator())
+
+        self.organize_btn = QtWidgets.QPushButton("Organize Textures")
+        self.organize_btn.setToolTip(
+            "Write material tags to shaders and move textures on disk\n"
+            "for Accepted items only.\n"
+            "Rejected and Pending items are not touched.\n"
+            "Maya's file texture paths will be updated automatically."
+        )
+        self.organize_btn.setEnabled(False)
+        self.organize_btn.clicked.connect(self._on_organize_clicked)
+        root.addWidget(self.organize_btn)
 
         root.addWidget(self._make_separator())
+
+        # ── Status bar ────────────────────────────────────────
+
         self.status_label = QtWidgets.QLabel("Ready")
         self.status_label.setAlignment(QtCore.Qt.AlignLeft)
         root.addWidget(self.status_label)
@@ -389,8 +404,8 @@ class ToolWindow(QtWidgets.QWidget):
             return
 
         self.table.clear()
-        self.all_results         = []
-        self._detail_index       = None
+        self.all_results = []
+        self._detail_index = None
         self.detail_group.setVisible(False)
         self.organize_btn.setEnabled(False)
         self.accept_high_btn.setEnabled(False)
@@ -404,33 +419,40 @@ class ToolWindow(QtWidgets.QWidget):
             self.status_label.setText(f"Scanning {current} / {total} — {object_name}")
             QtWidgets.QApplication.processEvents()
 
-        t0      = time.monotonic()
+        t0 = time.monotonic()
         results = self.tools.scan_and_classify(progress_callback=on_progress)
         elapsed = time.monotonic() - t0
 
         for transform, data in results.items():
-            short      = transform.split("|")[-1]
+            short = transform.split("|")[-1]
             confidence = data.get("confidence", 0.0)
-            label      = data.get("label", "unknown")
+            label = data.get("label", "unknown")
 
             # High confidence + valid label → auto-accept
-            if confidence >= AUTO_ACCEPT_THRESHOLD and label not in ("unknown", "error"):
+            if confidence >= AUTO_ACCEPT_THRESHOLD and label not in (
+                "unknown",
+                "error",
+            ):
                 initial_status = "accepted"
             else:
                 initial_status = "pending"
 
-            self.all_results.append({
-                "transform":   transform,
-                "short":       short,
-                "label":       label,
-                "confidence":  confidence,
-                "all_scores":  data.get("all_scores", {}),
-                "shader":      data.get("shader"),      # read at scan time by get_shader_name()
-                "override":    None,
-                "status":      initial_status,
-                "albedo_path": data.get("albedo_path"),
-                "all_paths":   data.get("all_paths", []),
-            })
+            self.all_results.append(
+                {
+                    "transform": transform,
+                    "short": short,
+                    "label": label,
+                    "confidence": confidence,
+                    "all_scores": data.get("all_scores", {}),
+                    "shader": data.get(
+                        "shader"
+                    ),  # read at scan time by get_shader_name()
+                    "override": None,
+                    "status": initial_status,
+                    "albedo_path": data.get("albedo_path"),
+                    "all_paths": data.get("all_paths", []),
+                }
+            )
 
         self._on_scan_complete(total, elapsed)
 
@@ -447,7 +469,7 @@ class ToolWindow(QtWidgets.QWidget):
                 default_dir = os.path.join(os.path.dirname(scene_path), "textures")
             else:
                 project_root = cmds.workspace(query=True, rootDirectory=True) or ""
-                default_dir  = os.path.join(project_root, "sourceimages", "textures")
+                default_dir = os.path.join(project_root, "sourceimages", "textures")
             self.output_path_field.setText(os.path.normpath(default_dir))
 
         self.organize_btn.setEnabled(True)
@@ -485,31 +507,38 @@ class ToolWindow(QtWidgets.QWidget):
 
             # Confidence cell
             if entry["override"]:
-                conf_str     = "manual"
+                conf_str = "manual"
                 conf_tooltip = f"Manually overridden — original confidence: {entry['confidence'] * 100:.1f}%"
             else:
-                conf_str     = confidence_tier(entry["confidence"])
+                conf_str = confidence_tier(entry["confidence"])
                 conf_tooltip = (
                     f"{entry['confidence'] * 100:.1f}%"
-                    if entry["confidence"] > 0 else "—"
+                    if entry["confidence"] > 0
+                    else "—"
                 )
 
             # Material cell
-            material_str = f"{entry['override']} *" if entry["override"] else entry["label"]
+            material_str = (
+                f"{entry['override']} *" if entry["override"] else entry["label"]
+            )
 
-            row = QtWidgets.QTreeWidgetItem([
-                entry["short"],
-                material_str,
-                conf_str,
-                entry["status"].capitalize(),
-            ])
+            row = QtWidgets.QTreeWidgetItem(
+                [
+                    entry["short"],
+                    material_str,
+                    conf_str,
+                    entry["status"].capitalize(),
+                ]
+            )
 
             row.setData(0, QtCore.Qt.UserRole, i)
             row.setToolTip(COL_CONFIDENCE, conf_tooltip)
 
             if entry["override"]:
-                row.setToolTip(COL_MATERIAL,
-                    f"Manually overridden — original prediction: {entry['label']}")
+                row.setToolTip(
+                    COL_MATERIAL,
+                    f"Manually overridden — original prediction: {entry['label']}",
+                )
 
             self.table.addTopLevelItem(row)
 
@@ -526,18 +555,27 @@ class ToolWindow(QtWidgets.QWidget):
 
                 if entry["override"]:
                     item.setText(COL_MATERIAL, f"{entry['override']} *")
-                    item.setToolTip(COL_MATERIAL,
-                        f"Manually overridden — original prediction: {entry['label']}")
+                    item.setToolTip(
+                        COL_MATERIAL,
+                        f"Manually overridden — original prediction: {entry['label']}",
+                    )
                     item.setText(COL_CONFIDENCE, "manual")
-                    item.setToolTip(COL_CONFIDENCE,
-                        f"Manually overridden — original confidence: {entry['confidence'] * 100:.1f}%")
+                    item.setToolTip(
+                        COL_CONFIDENCE,
+                        f"Manually overridden — original confidence: {entry['confidence'] * 100:.1f}%",
+                    )
                 else:
                     item.setText(COL_MATERIAL, entry["label"])
                     item.setToolTip(COL_MATERIAL, "")
                     item.setText(COL_CONFIDENCE, confidence_tier(entry["confidence"]))
-                    item.setToolTip(COL_CONFIDENCE,
-                        f"{entry['confidence'] * 100:.1f}%"
-                        if entry["confidence"] > 0 else "—")
+                    item.setToolTip(
+                        COL_CONFIDENCE,
+                        (
+                            f"{entry['confidence'] * 100:.1f}%"
+                            if entry["confidence"] > 0
+                            else "—"
+                        ),
+                    )
 
                 item.setText(COL_STATUS, entry["status"].capitalize())
                 return
@@ -559,7 +597,7 @@ class ToolWindow(QtWidgets.QWidget):
             return
 
         if column == COL_STATUS:
-            entry           = self.all_results[result_index]
+            entry = self.all_results[result_index]
             entry["status"] = STATUS_CYCLE[entry["status"]]
             self._refresh_row(result_index)
             self._update_footer()
@@ -571,8 +609,10 @@ class ToolWindow(QtWidgets.QWidget):
     def _batch_accept_high(self):
         """Accept all items with confidence at or above 90%."""
         for entry in self.all_results:
-            if entry["confidence"] >= AUTO_ACCEPT_THRESHOLD and \
-               entry["label"] not in ("unknown", "error"):
+            if entry["confidence"] >= AUTO_ACCEPT_THRESHOLD and entry["label"] not in (
+                "unknown",
+                "error",
+            ):
                 entry["status"] = "accepted"
         self._populate_table()
         self._update_footer()
@@ -588,7 +628,7 @@ class ToolWindow(QtWidgets.QWidget):
     def _batch_reset(self):
         """Reset all statuses to Pending and clear all overrides."""
         for entry in self.all_results:
-            entry["status"]   = "pending"
+            entry["status"] = "pending"
             entry["override"] = None
         self._detail_index = None
         self.detail_group.setVisible(False)
@@ -605,18 +645,18 @@ class ToolWindow(QtWidgets.QWidget):
         """
         accepted = sum(1 for e in self.all_results if e["status"] == "accepted")
         rejected = sum(1 for e in self.all_results if e["status"] == "rejected")
-        pending  = sum(1 for e in self.all_results if e["status"] == "pending")
+        pending = sum(1 for e in self.all_results if e["status"] == "pending")
 
         self.footer_label.setText(
             f"{accepted} accepted  ·  {rejected} rejected  ·  {pending} pending"
         )
 
         dry = self.dry_run_chk.isChecked()
-        n   = accepted
+        n = accepted
         self.organize_btn.setText(
             f"Dry Run — would organize {n} item{'s' if n != 1 else ''}"
-            if dry else
-            f"Organize Textures ({n} accepted)"
+            if dry
+            else f"Organize Textures ({n} accepted)"
         )
 
     # ── Detail panel ──────────────────────────────────────────
@@ -632,13 +672,13 @@ class ToolWindow(QtWidgets.QWidget):
         _on_override_changed from firing during population.
         """
         self._detail_index = result_index
-        entry     = self.all_results[result_index]
+        entry = self.all_results[result_index]
         transform = entry["transform"]
 
         # Live result dict — paths may have changed if files were moved
-        live_data   = self.tools.results.get(transform, {})
+        live_data = self.tools.results.get(transform, {})
         albedo_path = live_data.get("albedo_path") or entry.get("albedo_path") or ""
-        all_paths   = live_data.get("all_paths") or entry.get("all_paths") or []
+        all_paths = live_data.get("all_paths") or entry.get("all_paths") or []
 
         # ── Asset name ────────────────────────────────────────
         asset_name = resolve_asset_name(albedo_path) if albedo_path else "—"
@@ -648,8 +688,8 @@ class ToolWindow(QtWidgets.QWidget):
         # Show the last two folder components so long paths stay readable.
         if albedo_path:
             src_folder = os.path.dirname(albedo_path)
-            parts      = src_folder.replace("\\", "/").split("/")
-            short_src  = "/".join(parts[-2:]) if len(parts) >= 2 else src_folder
+            parts = src_folder.replace("\\", "/").split("/")
+            short_src = "/".join(parts[-2:]) if len(parts) >= 2 else src_folder
             self.detail_source.setText(short_src)
             self.detail_source.setToolTip(src_folder)
         else:
@@ -666,21 +706,21 @@ class ToolWindow(QtWidgets.QWidget):
         # One filename per line — no checkmarks or bullet characters.
         # Empty when no texture set was found (unclassifiable objects).
         if all_paths:
-            self.detail_maps.setText(
-                "\n".join(os.path.basename(p) for p in all_paths)
-            )
+            self.detail_maps.setText("\n".join(os.path.basename(p) for p in all_paths))
         else:
             self.detail_maps.setText("—")
 
         # ── Classification ────────────────────────────────────
         # Normal:   "rock   (0.94 confidence)"
         # Override: "material* (manual)"
-        label      = entry.get("override") or entry["label"]
+        label = entry.get("override") or entry["label"]
         confidence = entry["confidence"]
         if entry["override"]:
             self.detail_classification.setText(f"{entry['override']} * (manual)")
         elif confidence > 0:
-            self.detail_classification.setText(f"{label}   ({confidence:.2f} confidence)")
+            self.detail_classification.setText(
+                f"{label}   ({confidence:.2f} confidence)"
+            )
         else:
             self.detail_classification.setText(label)
 
@@ -724,16 +764,18 @@ class ToolWindow(QtWidgets.QWidget):
         if self._detail_index is None:
             return
 
-        entry             = self.all_results[self._detail_index]
+        entry = self.all_results[self._detail_index]
         entry["override"] = None if text == "— keep —" else text
 
         # Update classification line in the detail panel immediately
-        label      = entry.get("override") or entry["label"]
+        label = entry.get("override") or entry["label"]
         confidence = entry["confidence"]
         if entry["override"]:
             self.detail_classification.setText(f"{entry['override']} * (manual)")
         elif confidence > 0:
-            self.detail_classification.setText(f"{label}   ({confidence:.2f} confidence)")
+            self.detail_classification.setText(
+                f"{label}   ({confidence:.2f} confidence)"
+            )
         else:
             self.detail_classification.setText(label)
 
@@ -745,13 +787,14 @@ class ToolWindow(QtWidgets.QWidget):
     def _on_browse_clicked(self):
         """Open a folder picker and write the chosen path into the path field."""
         current = self.output_path_field.text().strip()
-        start   = current if os.path.isdir(current) else ""
+        start = current if os.path.isdir(current) else ""
 
         chosen = QtWidgets.QFileDialog.getExistingDirectory(
             self,
             "Choose textures output folder",
             start,
-            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks,
+            QtWidgets.QFileDialog.ShowDirsOnly
+            | QtWidgets.QFileDialog.DontResolveSymlinks,
         )
         if chosen:
             self.output_path_field.setText(os.path.normpath(chosen))
@@ -772,7 +815,7 @@ class ToolWindow(QtWidgets.QWidget):
           4. Call pbr_tools.apply_approved() — writes metadata + moves files.
           5. Report result in the status bar.
         """
-        dry_run  = self.dry_run_chk.isChecked()
+        dry_run = self.dry_run_chk.isChecked()
         accepted = [e for e in self.all_results if e["status"] == "accepted"]
 
         if not accepted:
@@ -801,16 +844,19 @@ class ToolWindow(QtWidgets.QWidget):
             os.makedirs(chosen_dir, exist_ok=True)
 
         chosen_dir = os.path.normpath(chosen_dir)
-        n          = len(accepted)
-        word       = "item" if n == 1 else "items"
-        dry_note   = (
+        n = len(accepted)
+        word = "item" if n == 1 else "items"
+        dry_note = (
             "\n\nDry Run is ON — no files will be moved or scene modified."
-            if dry_run else ""
+            if dry_run
+            else ""
         )
 
         confirm = QtWidgets.QMessageBox(self)
         confirm.setWindowTitle("Organize Textures")
-        confirm.setText(f"{'[DRY RUN] ' if dry_run else ''}Organize {n} accepted {word}?")
+        confirm.setText(
+            f"{'[DRY RUN] ' if dry_run else ''}Organize {n} accepted {word}?"
+        )
         confirm.setInformativeText(
             f"For each accepted item this will:\n"
             f"  1. Write materialType + mlConfidence to the shader node\n"
@@ -821,9 +867,8 @@ class ToolWindow(QtWidgets.QWidget):
             f"{'This cannot be undone.' if not dry_run else ''}"
         )
 
-        ok_btn     = confirm.addButton(
-            "Run Dry Run" if dry_run else "Organize",
-            QtWidgets.QMessageBox.AcceptRole
+        ok_btn = confirm.addButton(
+            "Run Dry Run" if dry_run else "Organize", QtWidgets.QMessageBox.AcceptRole
         )
         cancel_btn = confirm.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
         confirm.setDefaultButton(cancel_btn)
@@ -845,23 +890,27 @@ class ToolWindow(QtWidgets.QWidget):
             QtWidgets.QApplication.processEvents()
 
         summary = self.tools.apply_approved(
-            review_queue      = self.all_results,
-            output_dir        = chosen_dir,
-            dry_run           = dry_run,
-            progress_callback = on_progress,
+            review_queue=self.all_results,
+            output_dir=chosen_dir,
+            dry_run=dry_run,
+            progress_callback=on_progress,
         )
 
-        tagged  = summary.get("metadata_written", 0)
-        moved   = summary.get("files_moved",      0)
-        skipped = summary.get("skipped",          0)
-        failed  = summary.get("failed",           0)
+        tagged = summary.get("metadata_written", 0)
+        moved = summary.get("files_moved", 0)
+        skipped = summary.get("skipped", 0)
+        failed = summary.get("failed", 0)
 
         prefix = "[DRY RUN] " if dry_run else ""
-        parts  = []
-        if tagged:  parts.append(f"{tagged} tagged")
-        if moved:   parts.append(f"{moved} moved")
-        if skipped: parts.append(f"{skipped} skipped")
-        if failed:  parts.append(f"{failed} failed")
+        parts = []
+        if tagged:
+            parts.append(f"{tagged} tagged")
+        if moved:
+            parts.append(f"{moved} moved")
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        if failed:
+            parts.append(f"{failed} failed")
 
         self.status_label.setText(
             f"{prefix}Done — " + (", ".join(parts) if parts else "nothing applied")
@@ -879,5 +928,45 @@ class ToolWindow(QtWidgets.QWidget):
                 self,
                 "Some items failed",
                 f"{failed} file{'s' if failed != 1 else ''} could not be moved.\n"
-                f"Check the Script Editor for details."
+                f"Check the Script Editor for details.",
             )
+    
+    def _make_collapsible(self, title, widget, collapsed=True):
+        """
+        Return a container with a clickable header that shows/hides widget.
+        Uses a QToolButton as the toggle — same pattern as Maya's Channel Box.
+        """
+        container = QtWidgets.QWidget()
+        layout    = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        # Toggle button acts as the section header
+        toggle = QtWidgets.QToolButton()
+        toggle.setText(f"  {title}")
+        toggle.setCheckable(True)
+        toggle.setChecked(not collapsed)   # checked = expanded
+        toggle.setArrowType(
+            QtCore.Qt.RightArrow if collapsed else QtCore.Qt.DownArrow
+        )
+        toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        toggle.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+
+        # Wire the toggle to show/hide the content widget and flip the arrow
+        def on_toggle(checked):
+            widget.setVisible(checked)
+            toggle.setArrowType(
+                QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
+            )
+
+        toggle.toggled.connect(on_toggle)
+
+        layout.addWidget(toggle)
+        layout.addWidget(widget)
+
+        # Set initial state
+        widget.setVisible(not collapsed)
+
+        return container
