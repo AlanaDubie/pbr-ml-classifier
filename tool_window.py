@@ -23,13 +23,15 @@
 #   Click Organize Textures → only accepted rows get metadata + files moved
 # ─────────────────────────────────────────────────────────────
 
+import importlib
 import os
 import time
 
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore, QtGui
 from maya import OpenMayaUI as omui
 from shiboken6 import wrapInstance
 import maya.cmds as cmds
+
 from widgets.collapsable import CollapsibleContainer
 
 from pbr_tools import PBRTools, CLASSES
@@ -72,6 +74,24 @@ def confidence_tier(value):
     elif value > 0:
         return "Low"
     return "—"
+
+def apply_confidence_color(item, text):
+    """Color the confidence column based on tier text."""
+
+    colors = {
+        "High": QtGui.QColor(90, 200, 120),
+        "Medium": QtGui.QColor(220, 170, 70),
+        "Low": QtGui.QColor(210, 90, 90),
+        "Manual": QtGui.QColor(120, 170, 255),
+    }
+
+    color = colors.get(text)
+
+    if color:
+        item.setForeground(
+            COL_CONFIDENCE,
+            QtGui.QBrush(color)
+        )
 
 
 def get_maya_main_window():
@@ -309,22 +329,49 @@ class ToolWindow(QtWidgets.QWidget):
         detail_layout.setSpacing(6)
 
         self.detail_asset = QtWidgets.QLabel("—")
-
         self.detail_source = QtWidgets.QLabel("—")
         self.detail_source.setWordWrap(True)
-
         self.detail_shader = QtWidgets.QLabel("—")
 
-        # Maps detected — one filename per line, no checkmarks
+        detail_layout.addRow("Asset:",        self.detail_asset)
+        detail_layout.addRow("Source folder:", self.detail_source)
+        detail_layout.addRow("Shader:",        self.detail_shader)
+
+        # ── Maps Detected — collapsible ───────────────────────
+        # Starts collapsed  
+ 
+        self._maps_container = CollapsibleContainer(
+            "Maps", collapsed=True, color_background=True
+        )
+        maps_inner_layout = QtWidgets.QVBoxLayout(self._maps_container.content_widget)
+        maps_inner_layout.setContentsMargins(100, 4, 8, 6)
+ 
         self.detail_maps = QtWidgets.QLabel("—")
         self.detail_maps.setWordWrap(True)
         self.detail_maps.setTextFormat(QtCore.Qt.PlainText)
+        maps_inner_layout.addWidget(self.detail_maps)
+ 
+        # addRow with no label string spans the full width — the
+        # CollapsibleContainer header already acts as the label.
+        detail_layout.addRow(self._maps_container)
 
         # Classification — predicted label + confidence, or "material* (manual)" if overridden
         self.detail_classification = QtWidgets.QLabel("—")
 
+        # Full Confidence scores for each category
+
+        self._conf_scores_container = CollapsibleContainer(
+            "Confidence Scores", collapsed=True, color_background=True
+        )
+        conf_scores_layout = QtWidgets.QVBoxLayout(self._conf_scores_container.content_widget)
+        conf_scores_layout.setContentsMargins(100, 4, 8, 6)
+
         self.detail_scores = QtWidgets.QLabel("—")
         self.detail_scores.setWordWrap(True)
+        conf_scores_layout.addWidget(self.detail_scores)
+        conf_scores_layout.addWidget(self.detail_scores)
+        
+        detail_layout.addRow(self._conf_scores_container)
 
         # Override dropdown — only place to change the predicted label
         self.override_combo = QtWidgets.QComboBox()
@@ -339,12 +386,6 @@ class ToolWindow(QtWidgets.QWidget):
             "The corrected label is used when organizing textures."
         )
 
-        detail_layout.addRow("Asset:", self.detail_asset)
-        detail_layout.addRow("Source folder:", self.detail_source)
-        detail_layout.addRow("Shader:", self.detail_shader)
-        detail_layout.addRow("Maps:", self.detail_maps)
-        detail_layout.addRow("Classification:", self.detail_classification)
-        detail_layout.addRow("Confidence Scores:", self.detail_scores)
         detail_layout.addRow("Override:", self.override_combo)
 
         self.detail_group.setVisible(False)
@@ -493,7 +534,7 @@ class ToolWindow(QtWidgets.QWidget):
 
         Confidence column:
           High / Medium / Low — quality tier
-          "manual"            — override has been set
+          "Manual"            — override has been set
           Tooltip shows the raw percentage on every row.
 
         Status column cycles on click. All other columns open detail panel.
@@ -507,7 +548,7 @@ class ToolWindow(QtWidgets.QWidget):
 
             # Confidence cell
             if entry["override"]:
-                conf_str = "manual"
+                conf_str = "Manual"
                 conf_tooltip = f"Manually overridden — original confidence: {entry['confidence'] * 100:.1f}%"
             else:
                 conf_str = confidence_tier(entry["confidence"])
@@ -530,6 +571,8 @@ class ToolWindow(QtWidgets.QWidget):
                     entry["status"].capitalize(),
                 ]
             )
+
+            apply_confidence_color(row, conf_str)
 
             row.setData(0, QtCore.Qt.UserRole, i)
             row.setToolTip(COL_CONFIDENCE, conf_tooltip)
@@ -559,7 +602,7 @@ class ToolWindow(QtWidgets.QWidget):
                         COL_MATERIAL,
                         f"Manually overridden — original prediction: {entry['label']}",
                     )
-                    item.setText(COL_CONFIDENCE, "manual")
+                    item.setText(COL_CONFIDENCE, "Manual")
                     item.setToolTip(
                         COL_CONFIDENCE,
                         f"Manually overridden — original confidence: {entry['confidence'] * 100:.1f}%",
@@ -576,6 +619,11 @@ class ToolWindow(QtWidgets.QWidget):
                             else "—"
                         ),
                     )
+                
+                apply_confidence_color(
+                    item,
+                    item.text(COL_CONFIDENCE)
+                )
 
                 item.setText(COL_STATUS, entry["status"].capitalize())
                 return
@@ -716,7 +764,7 @@ class ToolWindow(QtWidgets.QWidget):
         label = entry.get("override") or entry["label"]
         confidence = entry["confidence"]
         if entry["override"]:
-            self.detail_classification.setText(f"{entry['override']} * (manual)")
+            self.detail_classification.setText(f"{entry['override']} * (Manual)")
         elif confidence > 0:
             self.detail_classification.setText(
                 f"{label}   ({confidence:.2f} confidence)"
@@ -771,7 +819,7 @@ class ToolWindow(QtWidgets.QWidget):
         label = entry.get("override") or entry["label"]
         confidence = entry["confidence"]
         if entry["override"]:
-            self.detail_classification.setText(f"{entry['override']} * (manual)")
+            self.detail_classification.setText(f"{entry['override']} * (Manual)")
         elif confidence > 0:
             self.detail_classification.setText(
                 f"{label}   ({confidence:.2f} confidence)"
