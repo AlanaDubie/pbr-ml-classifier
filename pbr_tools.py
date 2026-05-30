@@ -15,6 +15,17 @@
 #   It only runs ML inference and stores predictions.
 #   Everything destructive happens in apply_approved() after the
 #   artist has reviewed results in the UI.
+#
+# Texture set collection strategy:
+#   get_texture_set() walks listHistory on the shading engine — not just
+#   direct connections to the shader — so file nodes routed through bump2d,
+#   aiNormalMap, displacementShader, colorCorrect, etc. are all captured.
+#
+# File update strategy:
+#   apply_approved() moves every file node in the scene whose path lives in
+#   the same source folder as the albedo, not just the ones found by the node
+#   graph walk. This catches maps wired into slots we don't enumerate
+#   (coat, sheen, anisotropy, etc.) and updates their Maya paths correctly.
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -31,83 +42,45 @@ except ImportError:
 
 CLASSES = ["fabric", "ground", "metal", "rock", "wood"]
 
-# Maya-generated folders that should not prevent cleanup
+# Maya-generated folders that should never block folder cleanup
 _MAYA_JUNK_DIRS = frozenset({".mayaSwatches"})
-
-
-def _folder_is_empty(folder: str):
-    """
-    Return True if the folder contains nothing except Maya junk folders.
-    """
-
-    try:
-        entries = os.listdir(folder)
-        real_entries = [e for e in entries if e not in _MAYA_JUNK_DIRS]
-        return len(real_entries) == 0
-    except Exception:
-        return False
 
 
 def _remove_if_empty(folder):
     """
-    Remove a folder if it only contains Maya-generated junk folders.
+    Remove a folder if it contains nothing except Maya-generated junk.
 
-    This safely removes leftover empty asset folders after texture sets
-    are moved to a new destination root.
-
-    Example:
-        old_textures/rock/cliff_rock_a_v1/
-
-    Maya may leave:
-        .mayaSwatches/
-
-    behind, which prevents normal os.rmdir() cleanup.
+    After moving a texture set, Maya sometimes leaves .mayaSwatches/
+    behind which prevents a plain os.rmdir(). This walks those junk
+    folders out first, then removes the parent if truly empty.
     """
-
     try:
         if not folder or not os.path.isdir(folder):
             return
 
-        entries = os.listdir(folder)
-
-        # Ignore Maya-generated cache folders
-        real_entries = []
-
-        for e in entries:
-            if e not in _MAYA_JUNK_DIRS:
-                real_entries.append(e)
-
-        # Stop if real files/folders still exist
+        real_entries = [e for e in os.listdir(folder) if e not in _MAYA_JUNK_DIRS]
         if real_entries:
             return
 
-        # Remove Maya junk folders recursively
         for junk in _MAYA_JUNK_DIRS:
-
             junk_path = os.path.join(folder, junk)
-
             if os.path.isdir(junk_path):
-
                 for root, dirs, files in os.walk(junk_path, topdown=False):
-
                     for f in files:
                         try:
                             os.remove(os.path.join(root, f))
                         except Exception:
                             pass
-
                     for d in dirs:
                         try:
                             os.rmdir(os.path.join(root, d))
                         except Exception:
                             pass
-
                 try:
                     os.rmdir(junk_path)
                 except Exception:
                     pass
 
-        # Remove parent folder if empty now
         if not os.listdir(folder):
             os.rmdir(folder)
             print(f"[pbr_tools] Removed empty folder: {folder}")
@@ -125,107 +98,137 @@ class PBRTools:
     # ── Mesh collection ──────────────────────────────────────
 
     def get_selected_meshes(self):
-
+        """Return transform nodes for the current selection."""
         selection = cmds.ls(selection=True, long=True, type="transform")
-
-        meshes = []
-
-        for obj in selection:
-            shapes = cmds.listRelatives(obj, shapes=True, fullPath=True) or []
-
-            if shapes:
-                meshes.append(obj)
-
+        meshes = [
+            obj for obj in selection
+            if cmds.listRelatives(obj, shapes=True, fullPath=True)
+        ]
         self.objects = meshes
         return meshes
 
     def get_all_scene_meshes(self):
-
+        """Return transform nodes for every mesh in the scene."""
         all_meshes = cmds.ls(type="mesh", long=True)
         transforms = cmds.listRelatives(all_meshes, parent=True, fullPath=True) or []
-
         self.objects = list(set(transforms))
         return self.objects
 
     # ── Shader lookup ─────────────────────────────────────────
 
     def get_shader_name(self, transform):
-
+        """Return the surface shader node name for a transform, or None."""
         shapes = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
-
         if not shapes:
             return None
-
-        shading_engines = cmds.listConnections(shapes, type="shadingEngine") or []
-
-        for sg in shading_engines:
+        for sg in cmds.listConnections(shapes, type="shadingEngine") or []:
             shaders = cmds.listConnections(f"{sg}.surfaceShader") or []
-
             if shaders:
                 return shaders[0]
-
         return None
 
     # ── Texture set extraction ───────────────────────────────
 
     def get_texture_set(self, transform):
+        """
+        Return a dict with albedo_path, all_paths, and file_nodes for the
+        texture set associated with this transform's shader.
 
+        Two-phase approach:
+          1. Node graph — walk listHistory on the shading engine to find every
+             file node actually connected in Maya, regardless of intermediate
+             nodes (bump2d, aiNormalMap, displacementShader, etc.).
+          2. Disk siblings — once we have the albedo path, scan its parent
+             folder for image files not wired as file nodes in the scene.
+             This is common when artists connect only the diffuse/color map
+             and leave the rest of the PBR set on disk but unconnected.
+
+        Returns None if no albedo can be found at all.
+        """
         shapes = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
-
         if not shapes:
             return None
 
         shading_engines = cmds.listConnections(shapes, type="shadingEngine") or []
-
         if not shading_engines:
             return None
+
+        ALBEDO_ATTRS = ["baseColor", "color", "baseColorMap", "diffuseColor"]
+
+        IMAGE_EXTS = {
+            ".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff",
+            ".exr", ".hdr", ".bmp", ".psd", ".tx", ".rat",
+        }
 
         albedo_path = None
         all_paths   = []
         file_nodes  = []
 
-        ALBEDO_ATTRS = ["baseColor", "color", "baseColorMap", "diffuseColor"]
-
         for sg in shading_engines:
 
             shaders = cmds.listConnections(f"{sg}.surfaceShader") or []
 
+            # ── Phase 1a: find albedo via known color attributes ──
             for shader in shaders:
-
-                # ── Find albedo first ────────────────────────
-
                 for attr in ALBEDO_ATTRS:
-
                     if not cmds.attributeQuery(attr, node=shader, exists=True):
                         continue
-
                     for fn in cmds.listConnections(f"{shader}.{attr}", type="file") or []:
-
                         p = cmds.getAttr(f"{fn}.fileTextureName")
-
                         if p and os.path.exists(p) and albedo_path is None:
                             albedo_path = p
 
-                # ── Collect ALL file nodes ───────────────────
+            # ── Phase 1b: collect all connected file nodes ────────
+            # Walk listHistory on the SHADER nodes (not the shading engine).
+            # listHistory(sg) is too broad — it can return file nodes from
+            # other materials that happen to share graph history. Scoping to
+            # each shader keeps results strictly to this material's network.
+            # We also explicitly walk the sg's displacement slot because that
+            # connection doesn't go through surfaceShader.
+            nodes_to_walk = list(shaders)
+            disp = cmds.listConnections(f"{sg}.displacementShader") or []
+            nodes_to_walk.extend(disp)
 
-                for fn in cmds.listConnections(shader, type="file") or []:
-
-                    p = cmds.getAttr(f"{fn}.fileTextureName")
-
-                    if not p or not os.path.exists(p) or fn in file_nodes:
+            for root_node in nodes_to_walk:
+                for fn in cmds.ls(cmds.listHistory(root_node) or [], type="file"):
+                    if fn in file_nodes:
                         continue
-
+                    p = cmds.getAttr(f"{fn}.fileTextureName")
+                    if not p or not os.path.exists(p):
+                        continue
                     if ".mayaSwatches" in p.replace("\\", "/"):
                         continue
-
                     all_paths.append(p)
                     file_nodes.append(fn)
 
-        if not all_paths:
+        if not all_paths and not albedo_path:
             return None
 
         if albedo_path is None:
             albedo_path = all_paths[0]
+
+        # ── Phase 2: disk sibling scan ────────────────────────────
+        # Many PBR workflows only wire the diffuse map and leave the rest on
+        # disk unconnected. Scan the albedo folder for sibling image files so
+        # the full set is shown in the UI and moved correctly during organize.
+        src_dir    = os.path.normpath(os.path.dirname(albedo_path))
+        known_norm = {os.path.normpath(p) for p in all_paths}
+
+        try:
+            all_files = os.listdir(src_dir)
+            for fname in sorted(all_files):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in IMAGE_EXTS:
+                    continue
+                full = os.path.normpath(os.path.join(src_dir, fname))
+                if full in known_norm:
+                    continue
+                if ".mayaSwatches" in full.replace("\\", "/"):
+                    continue
+                all_paths.append(full)
+                known_norm.add(full)
+        except OSError as e:
+            print(f"[pbr_tools] Could not scan texture folder: {e}")
 
         return {
             "albedo_path": albedo_path,
@@ -236,75 +239,54 @@ class PBRTools:
     # ── Metadata writing ─────────────────────────────────────
 
     def write_metadata(self, transform, label, confidence):
-
+        """
+        Stamp materialType and mlConfidence onto the surface shader.
+        Adds the attributes if they don't already exist.
+        Returns the shader node name, or None if nothing was written.
+        """
         shapes = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
-
         if not shapes:
             return None
 
         shader_name = None
 
-        shading_engines = cmds.listConnections(shapes, type="shadingEngine") or []
-
-        for sg in shading_engines:
-
-            shaders = cmds.listConnections(f"{sg}.surfaceShader") or []
-
-            for shader in shaders:
+        for sg in cmds.listConnections(shapes, type="shadingEngine") or []:
+            for shader in cmds.listConnections(f"{sg}.surfaceShader") or []:
 
                 if not cmds.attributeQuery("materialType", node=shader, exists=True):
-                    cmds.addAttr(
-                        shader,
-                        longName="materialType",
-                        dataType="string",
-                        keyable=False
-                    )
-
-                cmds.setAttr(
-                    f"{shader}.materialType",
-                    label,
-                    type="string"
-                )
+                    cmds.addAttr(shader, longName="materialType",
+                                 dataType="string", keyable=False)
+                cmds.setAttr(f"{shader}.materialType", label, type="string")
 
                 if not cmds.attributeQuery("mlConfidence", node=shader, exists=True):
-                    cmds.addAttr(
-                        shader,
-                        longName="mlConfidence",
-                        attributeType="float",
-                        keyable=False
-                    )
-
-                cmds.setAttr(
-                    f"{shader}.mlConfidence",
-                    confidence
-                )
+                    cmds.addAttr(shader, longName="mlConfidence",
+                                 attributeType="float", keyable=False)
+                cmds.setAttr(f"{shader}.mlConfidence", confidence)
 
                 shader_name = shader
-
-                print(
-                    f"[pbr_tools] Tagged {shader} → "
-                    f"{label} ({confidence*100:.1f}%)"
-                )
+                print(f"[pbr_tools] Tagged {shader} → {label} ({confidence*100:.1f}%)")
 
         return shader_name
 
     # ── Scan pipeline ────────────────────────────────────────
 
     def scan_and_classify(self, progress_callback=None):
+        """
+        Classify every object in self.objects.
 
+        Phase 1 — collect texture sets and shader names (read-only Maya queries).
+        Phase 2 — run ML inference on each albedo path.
+        Phase 3 — store results; nothing is written to the scene.
+        """
         self.results = {}
         total = len(self.objects)
-
-        # ── Phase 1: collect texture sets + shader names ────
 
         if progress_callback:
             progress_callback(0, total, "Collecting textures...")
 
         texture_sets = {}
         shader_names = {}
-
         for transform in self.objects:
-
             texture_sets[transform] = self.get_texture_set(transform)
             shader_names[transform] = self.get_shader_name(transform)
 
@@ -312,11 +294,8 @@ class PBRTools:
         unclassifiable = {t: ts for t, ts in texture_sets.items() if not ts}
 
         for transform in unclassifiable:
-
             short = transform.split("|")[-1]
-
             print(f"[pbr_tools] No textures found for {short} — skipping")
-
             self.results[transform] = {
                 "label":       "unknown",
                 "confidence":  0.0,
@@ -329,20 +308,12 @@ class PBRTools:
         if not classifiable:
             return self.results
 
-        # ── Phase 2: classify ────────────────────────────────
-
         transforms_list = list(classifiable.keys())
         sets_list       = list(classifiable.values())
 
-        predictions = [
-            predict(ts["albedo_path"])
-            for ts in sets_list
-        ]
-
-        # ── Phase 3: store results ───────────────────────────
+        predictions = [predict(ts["albedo_path"]) for ts in sets_list]
 
         for i, transform in enumerate(transforms_list):
-
             short      = transform.split("|")[-1]
             tex_set    = sets_list[i]
             prediction = predictions[i]
@@ -351,9 +322,7 @@ class PBRTools:
                 progress_callback(i + 1, total, short)
 
             if not prediction or "error" in prediction:
-
                 print(f"[pbr_tools] Inference failed for {short}")
-
                 self.results[transform] = {
                     "label":       "error",
                     "confidence":  0.0,
@@ -362,7 +331,6 @@ class PBRTools:
                     "all_scores":  {},
                     "shader":      shader_names.get(transform),
                 }
-
                 continue
 
             self.results[transform] = {
@@ -374,26 +342,33 @@ class PBRTools:
                 "shader":      shader_names.get(transform),
             }
 
-            n_maps = len(tex_set["all_paths"])
-
             print(
                 f"[pbr_tools] {short} → {prediction['label']} "
                 f"({prediction['confidence']*100:.1f}%) | "
-                f"{n_maps} map(s) found"
+                f"{len(tex_set['all_paths'])} map(s) found"
             )
 
         return self.results
 
     # ── Apply approved ────────────────────────────────────────
 
-    def apply_approved(
-        self,
-        review_queue,
-        output_dir,
-        dry_run=False,
-        progress_callback=None
-    ):
+    def apply_approved(self, review_queue, output_dir,
+                       dry_run=False, progress_callback=None):
+        """
+        For every accepted entry:
+          1. Write materialType + mlConfidence to its shader node.
+          2. Move its texture set to output_dir/<label>/<asset>/.
+          3. Update every Maya file node whose path has moved.
 
+        File collection strategy:
+          all_paths from the scan captures what the node graph walk found.
+          To also catch maps that are connected in Maya but were missed
+          (e.g. wired through unusual intermediate nodes), we additionally
+          scan every file node in the scene and include any whose path sits
+          in the same source folder as the albedo.
+
+        Only accepted items are touched. Rejected and pending are left alone.
+        """
         prefix = "[DRY RUN]" if dry_run else "[pbr_tools]"
 
         accepted = [
@@ -404,27 +379,17 @@ class PBRTools:
         ]
 
         if not accepted:
-
             print(f"{prefix} No accepted items to apply.")
-
-            return {
-                "metadata_written": 0,
-                "files_moved": 0,
-                "skipped": 0,
-                "failed": 0,
-            }
+            return {"metadata_written": 0, "files_moved": 0,
+                    "skipped": 0, "failed": 0}
 
         total            = len(accepted)
         metadata_written = 0
         files_moved      = 0
         skipped          = 0
         failed           = 0
-
-        old_to_new = {}
-
+        old_to_new       = {}
         processed_albedos = set()
-
-        # ── Step 1: move texture sets + write metadata ──────
 
         for i, entry in enumerate(accepted):
 
@@ -434,206 +399,135 @@ class PBRTools:
             albedo_path = entry["albedo_path"]
             label       = entry.get("override") or entry["label"]
 
+            # Prefer live results (paths may have changed from a prior organize)
             all_paths = (
-                self.results.get(transform, {}).get("all_paths")
-                or [albedo_path]
+                self.results.get(transform, {}).get("all_paths") or [albedo_path]
             )
 
             if progress_callback:
                 progress_callback(i + 1, total, short)
 
-            # ── Write metadata ───────────────────────────────
-
+            # ── Write metadata ────────────────────────────────
             if dry_run:
-
-                print(
-                    f"{prefix} Would tag '{short}' → "
-                    f"materialType={label}, mlConfidence={confidence}"
-                )
-
+                print(f"{prefix} Would tag '{short}' → "
+                      f"materialType={label}, mlConfidence={confidence}")
             else:
-
-                shader = self.write_metadata(
-                    transform,
-                    label,
-                    confidence
-                )
-
+                shader = self.write_metadata(transform, label, confidence)
                 if transform in self.results:
                     self.results[transform]["shader"] = shader
                     self.results[transform]["label"]  = label
-
                 metadata_written += 1
-
-            # ── Move texture set ─────────────────────────────
 
             if not output_dir:
                 continue
 
             norm_albedo = os.path.normpath(albedo_path)
-
             if norm_albedo in processed_albedos:
-
-                print(
-                    f"{prefix} Skipping shared texture set for "
-                    f"{short} — already moved"
-                )
-
+                print(f"{prefix} Skipping shared texture set for "
+                      f"{short} — already moved")
                 continue
-
             processed_albedos.add(norm_albedo)
 
-            asset_name = resolve_asset_name(albedo_path)
-
+            asset_name  = resolve_asset_name(albedo_path)
             dest_folder = os.path.normpath(
                 os.path.join(output_dir, label, asset_name)
             )
+            src_dir = os.path.normpath(os.path.dirname(albedo_path))
 
             if dry_run:
                 print(f"{prefix} Would create: {dest_folder}/")
 
-            for src in all_paths:
+            # ── Build candidate list ──────────────────────────
+            # Start with what the node graph walk found, then add any
+            # file node in the scene whose path lives in the same folder.
+            # This catches maps connected through slots we don't enumerate
+            # and ensures their Maya paths are updated after the move.
+            known_norm = {os.path.normpath(p) for p in all_paths}
+            candidate_paths = list(all_paths)
 
-                norm_src = os.path.normpath(src)
+            for fn in cmds.ls(type="file") or []:
+                p = cmds.getAttr(f"{fn}.fileTextureName")
+                if not p:
+                    continue
+                norm_p = os.path.normpath(p)
+                if (
+                    os.path.normpath(os.path.dirname(norm_p)) == src_dir
+                    and norm_p not in known_norm
+                    and os.path.exists(norm_p)
+                    and ".mayaSwatches" not in norm_p.replace("\\", "/")
+                ):
+                    candidate_paths.append(p)
+                    known_norm.add(norm_p)
 
+            # ── Move files ────────────────────────────────────
+            for src in candidate_paths:
+                norm_src  = os.path.normpath(src)
                 dest_file = os.path.normpath(
-                    os.path.join(
-                        dest_folder,
-                        os.path.basename(src)
-                    )
+                    os.path.join(dest_folder, os.path.basename(src))
                 )
 
                 if norm_src == dest_file:
-
-                    print(
-                        f"{prefix} Already organized: "
-                        f"{os.path.basename(src)}"
-                    )
-
+                    print(f"{prefix} Already organized: {os.path.basename(src)}")
                     skipped += 1
                     continue
 
                 if os.path.exists(dest_file):
-
-                    print(
-                        f"{prefix} Skipping — exists at destination: "
-                        f"{dest_file}"
-                    )
-
+                    print(f"{prefix} Skipping — exists at destination: {dest_file}")
                     skipped += 1
                     continue
 
                 if dry_run:
-
-                    print(
-                        f"{prefix} Would move: "
-                        f"{os.path.basename(src)}  →  "
-                        f"{label}/{asset_name}/{os.path.basename(src)}"
-                    )
-
+                    print(f"{prefix} Would move: {os.path.basename(src)}  →  "
+                          f"{label}/{asset_name}/{os.path.basename(src)}")
                     files_moved += 1
-
                 else:
-
                     try:
                         os.makedirs(dest_folder, exist_ok=True)
-
                         shutil.move(src, dest_file)
-
                         old_to_new[norm_src] = dest_file
-
                         files_moved += 1
-
-                        print(
-                            f"{prefix} Moved → "
-                            f"{label}/{asset_name}/"
-                            f"{os.path.basename(src)}"
-                        )
-
+                        print(f"{prefix} Moved → {label}/{asset_name}/"
+                              f"{os.path.basename(src)}")
                     except Exception as err:
-
-                        print(
-                            f"{prefix} Failed to move "
-                            f"{os.path.basename(src)}: {err}"
-                        )
-
+                        print(f"{prefix} Failed to move "
+                              f"{os.path.basename(src)}: {err}")
                         failed += 1
 
-            # ── Cleanup old source folders ───────────────────
-            #
-            # Remove:
-            #   old_root/category/asset_name/
-            # and possibly:
-            #   old_root/category/
-            #
-            # if they became empty after moving files.
-            #
-            # Uses _remove_if_empty() so Maya swatch cache folders
-            # don't block cleanup.
+            # ── Cleanup empty source folders ──────────────────
+            if not dry_run and candidate_paths:
+                _remove_if_empty(src_dir)
+                _remove_if_empty(os.path.dirname(src_dir))
 
-            if not dry_run and all_paths:
-
-                src_folder = os.path.dirname(
-                    os.path.normpath(all_paths[0])
-                )
-
-                _remove_if_empty(src_folder)
-                _remove_if_empty(os.path.dirname(src_folder))
-
-        # ── Step 2: update Maya file texture nodes ───────────
-
+        # ── Update all Maya file texture nodes ────────────────
+        # old_to_new now contains every moved file, including sibling maps
+        # that weren't in the original all_paths list. Step through every
+        # file node in the scene and redirect any whose path has moved.
         if old_to_new and not dry_run:
-
             print("[pbr_tools] Updating Maya file texture paths...")
 
             for file_node in cmds.ls(type="file") or []:
-
-                current = cmds.getAttr(
-                    f"{file_node}.fileTextureName"
-                )
-
+                current = cmds.getAttr(f"{file_node}.fileTextureName")
                 if not current:
                     continue
-
                 norm = os.path.normpath(current)
-
                 if norm in old_to_new:
+                    cmds.setAttr(f"{file_node}.fileTextureName",
+                                 old_to_new[norm], type="string")
+                    print(f"[pbr_tools] Updated '{file_node}' → {old_to_new[norm]}")
 
-                    cmds.setAttr(
-                        f"{file_node}.fileTextureName",
-                        old_to_new[norm],
-                        type="string"
-                    )
-
-                    print(
-                        f"[pbr_tools] Updated "
-                        f"'{file_node}' → {old_to_new[norm]}"
-                    )
-
-            # Refresh stored results so the detail panel reflects
-            # new locations without a re-scan
-
+            # Refresh stored results so the detail panel shows new paths
             for transform, data in self.results.items():
-
                 p = data.get("albedo_path")
-
                 if p and os.path.normpath(p) in old_to_new:
                     data["albedo_path"] = old_to_new[os.path.normpath(p)]
-
                 if "all_paths" in data:
-
                     data["all_paths"] = [
                         old_to_new.get(os.path.normpath(p), p)
                         for p in data["all_paths"]
                     ]
 
-        print(
-            f"{prefix} Apply complete — "
-            f"{metadata_written} tagged, "
-            f"{files_moved} moved, "
-            f"{skipped} skipped, "
-            f"{failed} failed"
-        )
+        print(f"{prefix} Apply complete — {metadata_written} tagged, "
+              f"{files_moved} moved, {skipped} skipped, {failed} failed")
 
         return {
             "metadata_written": metadata_written,
