@@ -43,22 +43,20 @@ class _CollapsibleHeader(QtWidgets.QWidget):
         # Bottom layer — coloured background matching Maya's section headers
         background = QtWidgets.QLabel()
         background.setStyleSheet(
-            "QLabel { background-color: rgb(93, 93, 93); border-radius: 2px; }"
+            "QLabel { background-color: rgb(93, 93, 93); border-radius: 1px; }"
         )
  
-        # Top layer — arrow icon + bold section name
+        # Top layer — arrow icon + section name
         header_widget = QtWidgets.QWidget()
         header_layout = QtWidgets.QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(11, 0, 11, 0)
+        header_layout.setContentsMargins(4, 0, 4, 0)
  
         self._icon = QtWidgets.QLabel()
         self._icon.setPixmap(self._expand_icon)
         header_layout.addWidget(self._icon)
  
         label_font = QtGui.QFont()
-        label_font.setBold(True)
         label = QtWidgets.QLabel(name)
-        label.setFont(label_font)
         header_layout.addWidget(label)
  
         # Push everything to the left
@@ -118,7 +116,7 @@ class CollapsibleContainer(QtWidgets.QWidget):
         container.toggle()    — toggle current state
     """
  
-    def __init__(self, name, collapsed=True, color_background=False):
+    def __init__(self, name, collapsed=True, color_background=False, max_width=None):
         super().__init__()
  
         layout = QtWidgets.QVBoxLayout(self)
@@ -138,6 +136,13 @@ class CollapsibleContainer(QtWidgets.QWidget):
         self._header = _CollapsibleHeader(name, self._content_widget)
         layout.addWidget(self._header)
         layout.addWidget(self._content_widget)
+
+        # Optional maximum width to prevent the container stretching too wide
+        if max_width is not None:
+            try:
+                self.setMaximumWidth(int(max_width))
+            except Exception:
+                pass
  
         # Delegate header methods so callers can control state externally
         self.collapse = self._header.collapse
